@@ -1,0 +1,561 @@
+================================================================================
+ WARDEN — ENGINEERING ARCHITECTURE
+ The layer beneath WARDEN_DESIGN_v0.2.txt: module decomposition, core data
+ structures, the load-bearing algorithms, invariants, and their proofs.
+
+ Version: 0.1
+ Status: Proposed
+ Relationship: v0.2 is the RFC (what & why). This is the build spec (how).
+               Section 1 is a triple-check AUDIT of v0.2; Sections 2+ are the
+               engineering design that resolves the audit findings.
+ License (intended): Apache-2.0
+================================================================================
+
+--------------------------------------------------------------------------------
+ 0. SCOPE & METHOD
+--------------------------------------------------------------------------------
+v0.2 is solid at the RFC level, so per instruction it is TRIPLE-CHECKED, not
+re-derived. The method: take each load-bearing claim in v0.2, test it against
+(a) internal consistency and (b) the security/IFC literature it cites, and pin
+down anything left implicit. Section 1 lists the findings; the rest of the
+document is the architecture that resolves them.
+
+Grounding facts used throughout (all cited in v0.2 §10 unless noted):
+  * Denning & Denning 1977 — secure information flow is a LATTICE problem; the
+    combine operator on derived values is the least upper bound (join, ⊔).
+  * Bell-LaPadula (confidentiality) and Biba (integrity) are DUAL lattices.
+    This duality is the source of Finding F2 below and must be handled
+    explicitly, not glossed.
+  * Saltzer & Schroeder 1975 — a reference monitor is COMPLETE MEDIATION +
+    FAIL-SAFE DEFAULTS (default-deny) + ECONOMY OF MECHANISM; an enforcement
+    monitor must be always-invoked, tamperproof, and small enough to verify.
+  * Myers & Liskov, DLM (SOSP'97 / TOSEM'00) — decentralized labels; the
+    confidentiality JOIN is reader-set INTERSECTION (more owners ⇒ fewer
+    readers ⇒ more secret).
+  * RFC 8949 (CBOR) §4.2 — Core Deterministic Encoding. RFC 8785 (JCS) — JSON
+    canonicalization (rejected below, see F3).
+  * CaMeL (arXiv 2503.18813) — capabilities-as-metadata, P-LLM/Q-LLM, a value
+    store of handles. FIDES (2505.23643) — integrity+confidentiality labels.
+    NeuroTaint (2604.23374) — classical lexical taint MISSES semantic laundering
+    in LLMs. These three bound what M1 can honestly promise (Finding F5).
+
+--------------------------------------------------------------------------------
+ 1. TRIPLE-CHECK — AUDIT OF v0.2  (findings that change the build)
+--------------------------------------------------------------------------------
+F1. IDENTITY vs. LABELS ARE CONFLATED.  §5.2 lists "security labels AND replay
+    payload" as one bag of per-node metadata, never stating whether labels are
+    inside the content hash.
+    Why it matters: labels are DERIVED by propagation (label = ⊔ parents) and
+    are policy-/run-dependent. If a label were part of node identity, then the
+    same (model, params, messages, schema) bytes would yield DIFFERENT ids under
+    different policies — breaking cassette dedup and the replay cache, whose key
+    is exactly those bytes (§5.6). Replay must find the recorded response
+    REGARDLESS of labels.
+    RESOLUTION: a strict TWO-LAYER model (§4). Layer A = immutable content DAG
+    (identity, dedup, replay). Layer B = a derived label overlay (a map
+    node_id → Label, recomputed by propagation per policy version). This sharpens
+    v0.2's "two readings of one structure" into "one immutable structure + one
+    derived overlay." Everything downstream depends on this split.
+
+F2. INTEGRITY LATTICE ORIENTATION IS INTERNALLY INCONSISTENT.  §5.4 says
+    "Deriving a value JOINS input labels" AND "integrity: trusted JOIN untrusted
+    = untrusted." With the stated order TRUSTED ≥ UNTRUSTED, "trusted combine
+    untrusted = untrusted" is the MEET (⊓), not the join. This is the classic
+    Biba-vs-Bell-LaPadula duality trap.
+    RESOLUTION (§5): define ONE internal PROPAGATION lattice in which the join is
+    always the more-restrictive value. Orient integrity as a TAINT level with
+    UNTRUSTED = ⊤, TRUSTED = ⊥; orient confidentiality with SECRET = ⊤,
+    PUBLIC = ⊥. Then label(derived) = ⊔ parents holds UNIFORMLY for both axes and
+    the §6.5 monotonicity test is one consistent order. The policy DSL reads
+    integrity back in the human "trusted is good" direction. Two views, one
+    partial order; pick the internal one and never mix them.
+
+F3. CANONICALIZATION IS UNDERSPECIFIED — and the suggested approach is fragile.
+    §5.2 says "sort JSON keys; fix float formatting." JSON float canonicalization
+    is a genuine hazard (decimal round-tripping, -0, exponent form). A
+    content-addressing system must not rest on it.
+    RESOLUTION (§4.3): the hash PREIMAGE is canonical CBOR (RFC 8949 §4.2 Core
+    Deterministic Encoding), NOT JSON. Pin the exact rules: definite-length
+    items only; shortest-form integers; map keys sorted bytewise-lexicographic on
+    their encoded bytes; floats as 64-bit IEEE-754 (8 bytes, big-endian); reject
+    NaN/±Inf in canonical content (or normalize NaN to one payload). Domain-
+    separate node kinds with a type tag inside the envelope (prevents a
+    ToolResult and a UserInput with identical bytes from colliding). Encode the
+    id as a MULTIHASH (varint code ‖ varint length ‖ digest) so it self-describes
+    its algorithm and is future-proof. Conformance tests (§13) verify the chosen
+    library actually matches this spec — do not trust `canonical=True` blindly.
+
+F4. "NO BYPASS BY CONSTRUCTION" (P2) IS NOT ACHIEVABLE IN A PYTHON LIBRARY.
+    Python has no enforced encapsulation; agent code can call a tool's underlying
+    callable directly, around the monitor. Complete mediation "by construction"
+    is true for an OS kernel, not a library.
+    RESOLUTION (§8): state mediation honestly as the conjunction of THREE things:
+    (1) a runtime gate on every call routed through the Warden boundary;
+    (2) a STATIC bypass-lint (the §6.5 "no path reaches a sink without the
+    monitor" check) that flags direct calls to a registered sink's raw callable;
+    (3) the threat-model assumption (already half-stated in §5.9) that tools are
+    wired through Warden and honestly declare their source. The guarantee is
+    "complete mediation OVER REGISTERED SINKS INVOKED THROUGH THE BOUNDARY,"
+    verified by lint, not an absolute.
+
+F5. M1's LABEL-CREEP STORY IS WEAKER THAN THE HEADLINE — by construction of the
+    build order.  §8 R1 promises low label creep via reference handles; but
+    handles only fully work in the DUAL-PLANE design (M3), where the planner LLM
+    never sees raw untrusted content. In single-LLM M1, the planner DOES see raw
+    content, so you face the field's fundamental dilemma:
+      - whole-context taint  ⇒ SOUND but high label creep (agent unusable), or
+      - lexical per-value taint ⇒ low creep but UNDER-taints, because an LLM can
+        launder tainted text into freshly emitted tokens (NeuroTaint's "semantic
+        transfer," which lexical tracking misses).
+    RESOLUTION (§6): make the propagation strategy PLUGGABLE. M1 ships a
+    conservative-but-sound default with an explicit, measured creep budget (§6.3
+    is a release gate). The handle/value-environment DATA MODEL exists from M1
+    (§6.4) but its strongest guarantee — injected text cannot alter planner
+    control flow — is only delivered in M3. Document this precisely; never let
+    the README imply M1 alone defeats laundering.
+
+F6. DETERMINISTIC REPLAY UNDER ASYNC NEEDS MORE THAN CLOCK+RNG CAPTURE.  §5.6
+    lists "scheduling" as part of the nondeterministic surface and §6.6 tests
+    async/parallel, but recording wall-clock and RNG does not pin the
+    INTERLEAVING of concurrent boundary calls.
+    RESOLUTION (§10): a logical-sequence BOUNDARY SCHEDULER. Stamp each boundary
+    event with a monotonic logical seq at record; on replay, resolve boundary
+    results in that recorded order. We need not control the whole Python
+    scheduler — only the order in which WARDEN BOUNDARY calls resolve, because
+    every non-boundary computation is pure re-derivation (P6). This yields the
+    Determinism Theorem (§10.1) by induction over the DAG.
+
+F7. "FIRST DIVERGENCE = FIRST NON-MATCHING NODE ID" (§5.2) IS WELL-DEFINED ONLY
+    FOR A LINEAR CHAIN.  A DAG has no intrinsic "first."
+    RESOLUTION (§4.5): define a CANONICAL TOPOLOGICAL ORDER (causal order, ties
+    broken by node id). "First divergence" = first index at which two runs'
+    canonical topo sequences differ. Requires F1 (ids exclude labels) so policy
+    changes don't manufacture spurious divergence.
+
+Findings F1, F2, F3, F6 are correctness; F4, F5 are honesty/scoping; F7 is
+precision. None invalidate v0.2's thesis — they harden it.
+
+--------------------------------------------------------------------------------
+ 2. ARCHITECTURAL INVARIANTS  (CI-enforced; the spine of the system)
+--------------------------------------------------------------------------------
+INV-1  CONTENT IDENTITY EXCLUDES LABELS. node_id = multihash(canonical_cbor(
+       content_envelope)). Labels never enter the preimage. (Resolves F1.)
+INV-2  IMMUTABILITY. Content nodes and cassette objects are write-once. Same
+       content ⇒ same path ⇒ idempotent write ⇒ no concurrent-write conflicts.
+INV-3  LATTICE MONOTONICITY. label(derived) ⊒ ⊔(parents), with equality except
+       across an explicit Declassification node. (Resolves F2 once orientation
+       is fixed.)
+INV-4  COMPLETE MEDIATION (scoped). No registered sink executes its side effect
+       before the monitor returns ALLOW; verified by runtime gate + static lint.
+       (Resolves F4.)
+INV-5  FAIL-CLOSED. Unlabeled value at a sink ⇒ deny. Default-deny on
+       consequential capabilities. Cache miss on replay ⇒ raise.
+INV-6  EXPLAINABILITY. Every denial carries a provenance path; a denial without
+       one is a bug (test-enforced).
+INV-7  DETERMINISM BY SUBTRACTION. Only nondeterministic boundary inputs are
+       recorded; everything else is re-derived. (Resolves F6 via §10.1.)
+INV-8  NO SIDE EFFECTS ON REPLAY. World-mutating tools return recorded results;
+       they are never re-executed. (Makes attack-replay safe ⇒ enables security
+       regression tests.)
+INV-9  ACYCLIC LAYERS. The module dependency graph (§3) is a DAG; the Guard and
+       the Harness both depend on Core but NOT on each other (so M1 ships without
+       M2). Enforced by import-linter in CI.
+
+--------------------------------------------------------------------------------
+ 3. MODULE DECOMPOSITION  (Python packages; dependency DAG)
+--------------------------------------------------------------------------------
+  warden.core       content DAG, node schema, canonical CBOR, multihash, object
+                    store (fs), run manifest, topo order, fork/diff. PURE
+                    substrate — no security, no replay.
+  warden.labels     lattices (Taint, Confidentiality, ProvenanceSet), the Label
+                    product semilattice, join/leq, Declassification. PURE algebra.
+  warden.propagate  eager propagation over the DAG; pluggable strategy
+                    (whole-context | handle-based); the value environment.
+  warden.policy     DSL grammar → AST → compiled predicate; capability model;
+                    evaluation semantics (default-deny; deny ≻ allow). TOTAL,
+                    side-effect-free evaluator.
+  warden.monitor    the reference monitor: sink gate, mediation, the static
+                    bypass-lint, WardenPolicyViolation + provenance-path render.
+  warden.intercept  Mode 1 transport proxy; Mode 2 in-process shim (@wd.tool,
+                    wd.guard(), model-client wrap).
+  warden.harness    record/replay/fork/diff/counterfactual; boundary scheduler;
+                    cassette store.
+  warden.adapters   LangGraph / OpenAI Agents SDK / Pydantic AI / CrewAI; OTel.
+  warden.eval       AgentDojo, TaintBench, EchoLeak regression harness.
+
+  Dependency DAG (arrows = "depends on"):
+        labels ─┐
+                ├─▶ propagate ─▶ policy ─▶ monitor ─┐
+        core ───┤                                   ├─▶ intercept ─▶ adapters
+                └────────────────────▶ harness ─────┘
+        eval ─▶ (everything)
+  GUARD = {labels, propagate, policy, monitor}. HARNESS = {harness}. Both sit on
+  core; neither imports the other (INV-9). This is what lets M1 (Guard) ship and
+  stand alone before M2 (Harness), per v0.2 R4.
+
+--------------------------------------------------------------------------------
+ 4. WARDEN CORE — the two-layer provenance structure
+--------------------------------------------------------------------------------
+4.1  Layer A: the immutable content DAG
+----------------------------------------
+A run is a DAG of CONTENT nodes. Node kinds (v0.2 §5.2):
+    UserInput | SystemPrompt | LLMRequest | LLMResponse |
+    ToolCall  | ToolResult   | AgentState | FinalOutput | Declassification
+(Declassification added — see §5.4; it is the only place INV-3 equality is broken.)
+
+Every node is a frozen, slotted record:
+    @dataclass(frozen=True, slots=True)
+    class Node:
+        kind: NodeKind
+        parents: tuple[NodeId, ...]      # causal "derived-from" edges (ids)
+        payload: CanonicalValue          # kind-specific content (see 4.4)
+    NodeId = multihash digest of canonical_cbor(envelope(kind, parents, payload))
+
+Because parents are themselves ids, the structure is a Merkle DAG (git-style):
+content identity of a node transitively commits to its entire causal history.
+
+4.2  Layer B: the derived label overlay
+-----------------------------------------
+A LabelOverlay is a map  NodeId → Label  for a given (run, policy_version).
+It is NOT stored inside nodes (INV-1) and is recomputed by §6 propagation. It is
+the GUARD's working surface; the content DAG is the HARNESS's working surface.
+Same DAG, two overlays read from it — this is the v0.2 thesis, made precise.
+
+4.3  Canonical encoding & hashing (resolves F3)
+------------------------------------------------
+PREIMAGE = canonical CBOR (RFC 8949 §4.2), with these PINNED rules:
+  * definite-length items only; no indefinite-length.
+  * integers in shortest form.
+  * map keys sorted bytewise-lexicographic over their encoded representation.
+  * floats: 64-bit IEEE-754, 8-byte big-endian; NaN/±Inf rejected in canonical
+    content (caller must normalize before ingestion).
+  * strings: UTF-8, NFC-normalized at the ingestion boundary (so visually equal
+    text hashes equally).
+  * a leading TYPE TAG per node kind inside the envelope (domain separation).
+HASH is pluggable behind a HashAlgo protocol; id emitted as a MULTIHASH so the
+algorithm is self-describing and swappable. The FIXED default is BLAKE2b-256
+(stdlib) so node ids are reproducible with zero native dependencies; BLAKE3-256
+(faster, parallel) is opt-in behind the same protocol. The default is fixed, never
+"BLAKE3 if importable" — an environment-dependent default would make ids
+non-reproducible (a content-addressing bug).
+EPHEMERAL FIELDS normalized out before hashing: tool_call_id, request_id,
+provider timestamps → stable surrogates; latency and captured clock/RNG live in
+the REPLAY payload (Layer-A-adjacent metadata), never in the identity preimage.
+
+4.4  Per-kind payload split: identity vs. replay metadata
+----------------------------------------------------------
+Each node separates:
+  * IDENTITY payload — the canonical content that defines the node (e.g. for
+    LLMRequest: model, params, full messages, tool schema). This is exactly the
+    replay-cache key (§10), which is WHY it must exclude labels (F1).
+  * REPLAY metadata — recorded response bytes, stream chunks, latency, captured
+    clock/RNG. Stored beside the node, keyed by node id, excluded from identity.
+  * LABEL — lives only in Layer B.
+
+4.5  Topological order, fork, diff (resolves F7)
+-------------------------------------------------
+CANONICAL TOPO ORDER: Kahn's algorithm over causal edges; ties broken by node
+id (bytewise). Deterministic ⇒ "position i" is well-defined across runs.
+FORK is O(1): fork(node) creates a new run manifest pointing at the shared,
+immutable prefix root; no copy (INV-2 makes sharing safe).
+DIFF: walk two runs in canonical topo order; first index with differing ids is
+the divergence point (free, by content-addressing). A structural step-diff over
+the suffix then classifies WHAT differed (prompt? sampled tokens? tool result?)
+by comparing the differing nodes' identity payloads.
+
+4.6  On-disk store (refines v0.2 §5.8)
+---------------------------------------
+  ./.warden/objects/<hh>/<hash>          content nodes + replay metadata (zstd)
+  ./.warden/runs/<run_id>.json           manifest: root id, topo id list, meta
+  ./.warden/overlays/<run_id>.<polver>   serialized LabelOverlay (Layer B)
+  ./.warden/cassettes/<key>              request→response, keyed by identity hash
+  ./.warden/policies/<name>.wpol         compiled policy + source + version hash
+Writes are temp-file + fsync + atomic rename (crash-safe); content-addressing
+makes them idempotent (INV-2). Export: OpenTelemetry spans.
+
+--------------------------------------------------------------------------------
+ 5. LABEL ALGEBRA  (resolves F2; provably a semilattice)
+--------------------------------------------------------------------------------
+5.1  The three component lattices (single propagation orientation)
+-------------------------------------------------------------------
+TAINT (integrity, oriented for propagation):  TRUSTED ⊑ UNTRUSTED, ⊤ = UNTRUSTED.
+    join = max-taint. ("combine spreads taint" is now the JOIN, not the meet.)
+CONFIDENTIALITY (levels):  PUBLIC ⊑ INTERNAL ⊑ SECRET, ⊤ = SECRET. join = max.
+    Optional DLM mode: confidentiality as a READER SET; join = INTERSECTION of
+    readers (Myers & Liskov) — more restrictive = fewer readers. The level
+    lattice is the simple default; reader sets are the expressive opt-in.
+PROVENANCE: powerset ℘(SourceId); join = ∪; order = ⊆; ⊥ = ∅.
+
+5.2  The Label is the product semilattice
+------------------------------------------
+    Label = (Taint × Confidentiality × Provenance)
+    ⊔ is componentwise: (max-taint, max-conf/∩-readers, ∪-provenance)
+    ⊑ is componentwise.
+This product of join-semilattices is a join-semilattice. Therefore:
+  * join is ASSOCIATIVE, COMMUTATIVE, IDEMPOTENT, with identity ⊥ =
+    (TRUSTED, PUBLIC/all-readers, ∅).  (Property-tested, §13.)
+  * label(derived) = ⊔(parents) ⟹ INV-3 monotonicity holds BY CONSTRUCTION.
+The join is implemented as a monoid; the ONLY superlinear cost is the provenance
+∪ (§6.5 perf note).
+
+5.3  Policy-side reading (the human orientation)
+-------------------------------------------------
+The DSL exposes integrity as "trusted is good": `to.integrity != TRUSTED` means
+"taint ≠ ⊥" internally. The monitor translates once, at the boundary between the
+propagation lattice (internal) and the policy predicate (human). Two views of one
+partial order; never mixed inside the engine.
+
+5.4  Declassification (the only sanctioned monotonicity break)
+---------------------------------------------------------------
+A Declassification node lowers a component (e.g. SECRET→PUBLIC on user confirm).
+It is a FIRST-CLASS, AUDITED node in the DAG (so the forensics trail shows
+exactly where confidentiality was lowered and by whose authority). INV-3 permits
+label(child) ⊏ ⊔(parents) ONLY across such a node. This is FIDES's hide/reveal
+and v0.2 §5.4 "selective reveal," made into a typed graph event.
+
+--------------------------------------------------------------------------------
+ 6. PROPAGATION ENGINE  (resolves F5; the label-creep crux)
+--------------------------------------------------------------------------------
+6.1  Eager propagation
+-----------------------
+On node creation: label = ⊔(parents' labels) ⊔ source_label(if a boundary
+source). O(parents) per node (v0.2 §6.7). The label overlay is built as the DAG
+grows; sinks read finished labels (no ancestor walk at the gate).
+
+6.2  The strategy seam (the honest answer to label creep)
+----------------------------------------------------------
+PropagationStrategy is pluggable:
+  WHOLE_CONTEXT (M1 default): an LLMResponse joins the labels of ALL inputs in
+    its context. SOUND (no laundering escapes) but high creep. Fail-closed.
+  HANDLE_BASED (needs M3 dual-plane to be fully sound): untrusted blobs bind to
+    opaque HANDLES; the planner sees handles + schemas, not raw bytes; only
+    referenced values carry taint into tool args. Low creep.
+The seam exists so M1 can ship SOUND-conservative with a measured creep budget,
+and M3 can swap in the low-creep strategy WITHOUT touching the monitor or policy.
+
+6.3  The value environment (CaMeL-style; data model exists from M1)
+--------------------------------------------------------------------
+    Handle      = opaque id
+    ValueEnv    = Handle → (content_node_id, Label)
+A ToolResult marked untrusted is stored as a value bound to a Handle. Tool-call
+arguments are either constants (from trusted user/system prompt) or Handle
+references. At the sink, the monitor resolves arg → Handle → Label from the
+ValueEnv — per-VALUE labeling, not per-context. In M1 the planner may still see
+raw content (so taint can be laundered → that is why M1 also runs WHOLE_CONTEXT
+as the sound backstop); in M3 the planner sees only handles, closing the gap.
+
+6.4  The boundary v0.2 must state and this doc pins
+----------------------------------------------------
+Classical lexical taint cannot capture taint that flows via the LLM's semantic
+reasoning without copying bytes (NeuroTaint). Warden's position, stated as a
+GUARANTEE BOUNDARY, not a footnote:
+  * M1: SOUND over lexical + whole-context flows; conservative (creep budgeted).
+  * M3: adds control-flow integrity (injected text cannot steer the planner)
+    via dual-plane, the strongest practical guarantee.
+  * Residual: purely semantic/causal taint with no handle binding and no context
+    presence — out of scope, documented (v0.2 §5.9). We BOUND, we do not "solve."
+
+6.5  Performance
+-----------------
+Level joins are O(1). The provenance ∪ is the only superlinear op; bound it via
+hash-consed immutable sets (structural sharing) or, when |SourceId| is small,
+fixed-width BITSETS (∪ = OR, O(1)). Keeps §6.7's O(parents) budget real.
+
+--------------------------------------------------------------------------------
+ 7. POLICY DSL & CAPABILITY MODEL
+--------------------------------------------------------------------------------
+7.1  Language properties (security-critical)
+---------------------------------------------
+The policy evaluator runs on attacker-INFLUENCED labels, so the language itself
+must be incorruptible: TOTAL (always terminates), SIDE-EFFECT-FREE, no loops, no
+calls, no I/O. A small external grammar (e.g. Lark) → AST → compiled predicate.
+This satisfies v0.2's "versioned, compiled, unit-testable" and adds: provably
+terminating, decidable evaluation.
+
+7.2  Grammar (sketch; over the typed label model)
+--------------------------------------------------
+    rule    := ("deny" | "allow") action ["if" expr]
+    expr    := expr ("and"|"or") expr | "not" expr | "(" expr ")" | cmp
+    cmp     := lvalue op literal | literal "in" lvalue
+    lvalue  := ident "." ("integrity"|"confidentiality"|"provenance"|"readers")
+    op      := "==" | "!=" | "<=" | ">=" | "<" | ">"
+Comparisons are lattice comparisons in the human orientation (§5.3); set ops over
+provenance/readers. Type-checked at compile time.
+
+7.3  Capability model & evaluation semantics (resolves default-deny vs deny-rules)
+-----------------------------------------------------------------------------------
+Each registered tool declares: READ_ONLY or CONSEQUENTIAL (= a sink). A
+CONSEQUENTIAL action requires a capability. Evaluation for a call:
+    1. If any `deny` rule fires            → DENY  (deny ≻ allow).
+    2. Else if action is CONSEQUENTIAL and no `allow` matches → DENY (default-deny, INV-5).
+    3. Else                                → ALLOW.
+Read-only actions default-allow; consequential default-deny. A DENY raises
+WardenPolicyViolation with the provenance path (§8).
+
+--------------------------------------------------------------------------------
+ 8. THE REFERENCE MONITOR  (resolves F4; complete mediation, scoped honestly)
+--------------------------------------------------------------------------------
+8.1  The sink gate
+-------------------
+One mediation point fronts every CONSEQUENTIAL tool. BEFORE the side effect runs:
+  resolve arg labels (from ValueEnv / overlay) → evaluate compiled policy →
+  ALLOW runs the tool; DENY raises WardenPolicyViolation(path). (Saltzer &
+  Schroeder complete mediation + fail-safe defaults.)
+
+8.2  Mediation = three mechanisms, not one slogan (F4)
+-------------------------------------------------------
+  (1) RUNTIME GATE: every boundary-routed sink call passes the monitor (dynamic).
+  (2) STATIC BYPASS-LINT: an AST analysis (v0.2 §6.5) that flags any call to a
+      registered sink's raw callable outside the monitor — same family of
+      technique as agent-audit's static taint scan, used here to PROVE mediation
+      completeness rather than find vulns.
+  (3) ASSUMPTION (threat model, v0.2 §5.9): tools are wired through Warden and
+      declare their source honestly.
+GUARANTEE: complete mediation over registered sinks invoked through the boundary
+— verified, not absolute. (Mode 1 proxy gives stronger mediation for the MODEL
+boundary, since all LLM traffic is forced through base_url; tool mediation always
+needs the shim. State this asymmetry in docs.)
+
+8.3  The provenance path (INV-6)
+---------------------------------
+On DENY, walk the label overlay's contributing edges from the violating arg back
+to the offending source(s); render as:
+    "tainted at n2 (fetch_url, UNTRUSTED) → joined into `to` at n5 →
+     send_email#integrity blocked (requires TRUSTED)".
+This IS the harness's "derived-from" graph read as an explanation (v0.2 §5.7) —
+the artifact missing from the EchoLeak post-mortems.
+
+--------------------------------------------------------------------------------
+ 9. INTERCEPTION
+--------------------------------------------------------------------------------
+MODE 1 — TRANSPORT PROXY (zero code change): OpenAI/Anthropic-compatible
+    base_url; record + enforce in the middle. Strong mediation for the model
+    boundary; cannot see in-process tool calls.
+MODE 2 — IN-PROCESS SHIM (fine-grained): @wd.tool registers a tool with its
+    source label and consequential/read-only class; wd.guard() activates the
+    monitor; the model client is wrapped for capture + labeling. The shim is the
+    ONLY place labeling/enforcement/capture occur (v0.2 P1).
+Public API is unchanged from v0.2 §5.5 (it is good); the additions above are the
+machinery beneath it.
+
+--------------------------------------------------------------------------------
+ 10. THE HARNESS  (resolves F6; determinism made a theorem)
+--------------------------------------------------------------------------------
+10.1  Determinism Theorem
+--------------------------
+CLAIM: if (a) every boundary result is fixed by its identity-key, and (b)
+boundary results are delivered in recorded logical-seq order, and (c) all
+non-boundary code is deterministic given its inputs, then the replayed run is
+bit-identical to the recording (every node id matches).
+PROOF (induction over canonical topo order, §4.5): Base — source nodes
+(UserInput/SystemPrompt) are recorded verbatim ⇒ identical ids. Step — a node's
+identity payload is a deterministic function of its parents' content plus, if it
+is a boundary node, its recorded result (fixed by (a)) delivered at the right
+point (by (b)); by IH parents are identical, so by (c) the node's identity
+payload, hence its id, is identical. ∎
+COROLLARY: we need only a BOUNDARY scheduler (resolve Warden boundary calls in
+recorded seq order), not control of the whole interpreter — this is the minimal
+mechanism (economy of mechanism) that buys full trace determinism. (Resolves F6.)
+
+10.2  Mechanics
+----------------
+RECORD: at each boundary, key = identity hash of (model, params, full messages,
+tool schema); store request→response cassette; capture stream chunks + assembled
+message, clock, RNG state; stamp a monotonic logical seq; append node + edges.
+REPLAY: re-run the agent's deterministic code; substitute recorded responses by
+key; MISS → raise (INV-5); freeze clock, reseed RNG; deliver boundary results in
+recorded seq order; CONSEQUENTIAL tools are NOT executed — recorded result
+returned (INV-8). ⇒ replay is side-effect-free ⇒ safe to run attack recordings
+thousands of times ⇒ this is what makes security regression tests possible.
+FORK + SUFFIX REPLAY: fork(node) (O(1), §4.5); re-run from node; upstream hits
+cache, downstream live or cached per mode.
+COUNTERFACTUAL INJECTION: substitute a value at a node (e.g. inject an attacker
+string into a ToolResult), suffix-replay, assert containment. This is the GUARD's
+adversarial fuzzer.
+
+10.3  One taxonomy, two layers (unification)
+---------------------------------------------
+The Guard's CONSEQUENTIAL/READ_ONLY classification (§7.3) is the SAME taxonomy
+the harness uses to decide what not to re-run on replay (INV-8). Define it once.
+
+--------------------------------------------------------------------------------
+ 11. STORAGE & CONCURRENCY
+--------------------------------------------------------------------------------
+Content store is append-only + content-addressed ⇒ writes are idempotent and
+concurrent writers cannot conflict (INV-2): two processes writing identical
+content write the same bytes to the same path. Atomic temp+rename for crash
+safety. Label overlays are per-(run, policy_version) and recomputed, never
+mutated in place. Runs reference an immutable object set ⇒ forks and diffs are
+pure reads.
+
+--------------------------------------------------------------------------------
+ 12. IMPLEMENTATION STACK  (Python specifics, justified)
+--------------------------------------------------------------------------------
+  * Python ≥ 3.12; src layout; Apache-2.0.
+  * Immutable model: @dataclass(frozen=True, slots=True) for Node/Label ⇒
+    hashable, no accidental mutation, fits INV-2.
+  * Encoding: canonical CBOR (cbor2 or equivalent) — but treat the library as
+    UNTRUSTED for canonicalization: §13 conformance tests assert it matches the
+    §4.3 spec exactly (this is the F3 "triple-check the assumed-solid part").
+  * Hash: HashAlgo protocol; ids as multihash. Fixed default BLAKE2b-256
+    (stdlib, zero-dep, reproducible); BLAKE3-256 opt-in via the `blake3` extra.
+  * Policy: Lark grammar → AST → compiled total predicate.
+  * Typing: mypy --strict / pyright strict, ZERO ignores in warden.core and
+    warden.monitor (v0.2 §6.8).
+  * Tests: pytest + Hypothesis (property tests). ruff for lint.
+  * CI: import-linter (INV-9), mypy/pyright, property tests, AgentDojo ASR gate,
+    label-creep/false-positive gate, determinism byte-stability gate, overhead
+    gate (v0.2 §6.8).
+
+--------------------------------------------------------------------------------
+ 13. INVARIANT → PROPERTY-TEST MAP  (every invariant is mechanically checked)
+--------------------------------------------------------------------------------
+  INV-1  canonicalization conformance: shuffled map keys / differing tool_call_id
+         / reformatted floats ⇒ SAME node id; differing identity payload ⇒
+         DIFFERENT id; labels never change id.
+  INV-2  write idempotence: writing identical content twice is a no-op; same
+         content ⇒ same path.
+  INV-3  label monotonicity: ∀ node, label ⊒ ⊔(parents), equality except across a
+         Declassification node. Plus semilattice laws on ⊔: associativity,
+         commutativity, idempotence, identity (Hypothesis).
+  INV-4  mediation completeness: static lint finds NO sink call outside the
+         monitor on a corpus; runtime assertion fires if one slips through.
+  INV-5  fail-closed: unlabeled-at-sink ⇒ deny; replay cache miss ⇒ raise;
+         consequential w/o allow ⇒ deny.
+  INV-6  every WardenPolicyViolation carries a non-empty provenance path.
+  INV-7/8 determinism: hashes(replay(r)) == hashes(r) across multi-step, STREAMING,
+         async/parallel, time- and RNG-dependent tools; consequential tools not
+         re-executed on replay (observed via a spy).
+  INV-9  import-linter: dependency graph is the §3 DAG; guard ⊥ harness.
+  Security E2E: AgentDojo (utility / utility-under-attack / ASR incl. ADAPTIVE);
+  EchoLeak suite (outbound link / auto-fetched image / benign POST + cross-call
+  laundering) all blocked with a trace; TaintBench propagation cases.
+
+--------------------------------------------------------------------------------
+ 14. BUILD ORDER → MODULES → HONEST GUARANTEE PER MILESTONE
+--------------------------------------------------------------------------------
+  M0  warden.core (+ labels): two-layer DAG, canonical CBOR/multihash, store,
+      topo/fork/diff. GUARANTEE: stable content-addressing (INV-1/2), proven by
+      conformance + property tests. No security yet.
+  M1  warden.{labels,propagate(WHOLE_CONTEXT),policy,monitor} + intercept Mode 2 +
+      eval(EchoLeak, AgentDojo). FIRST PUBLIC RELEASE. GUARANTEE: sound,
+      conservative IFC over lexical/whole-context flows; complete mediation over
+      registered sinks (lint-verified); fail-closed; explainable. Publish
+      AgentDojo numbers + the label-creep budget. HONEST LIMIT: no control-flow
+      integrity yet; laundering handled only by conservative over-taint.
+  M2  warden.harness wired as the Guard's test + forensics harness (NOT a
+      standalone debugger). GUARANTEE: byte-stable replay (Theorem §10.1),
+      side-effect-free attack replay, counterfactual fuzzing.
+  M3  dual-plane (P-LLM/Q-LLM) + HANDLE_BASED propagation + declassification.
+      GUARANTEE upgrade: injected text cannot steer planner control flow; label
+      creep drops to the handle-tracked minimum.
+  M4  adapters (LangGraph/OpenAI/Pydantic/CrewAI) + OTel export.
+
+The single highest-risk item remains label creep (v0.2 §8 R1, this doc F5/§6).
+The strategy seam (§6.2) is the architectural hedge: ship sound-conservative,
+measure creep as a release gate, and swap in low-creep handle tracking at M3
+without disturbing the monitor or policy engine.
+
+================================================================================
+ END — WARDEN ENGINEERING ARCHITECTURE v0.1
+================================================================================

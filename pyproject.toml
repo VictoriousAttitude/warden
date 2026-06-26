@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "warden"
+version = "0.0.0"
+description = "A runtime trust layer for LLM agents: information-flow control and capability enforcement at the tool boundary."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Dima Khaver" }]
+keywords = ["llm", "agents", "security", "information-flow-control", "prompt-injection"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+]
+# Core identity layer is dependency-free: the default hash is stdlib BLAKE2b-256,
+# which keeps node ids reproducible on any interpreter without a native build.
+dependencies = []
+
+[project.optional-dependencies]
+# BLAKE3 is the intended production hash (faster, parallel); it is opt-in behind
+# the HashAlgo seam. The multihash prefix on every node id records which algorithm
+# produced it, so switching is a clean, detectable migration rather than a silent
+# change of identity.
+blake3 = ["blake3>=0.4"]
+dev = [
+  "pytest>=8",
+  "hypothesis>=6",
+  "mypy>=1.10",
+  "ruff>=0.5",
+  "cbor2>=5",          # used ONLY as an independent decode oracle in tests
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warden"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = false
+# INV: zero ignores in the identity-critical core.
+[[tool.mypy.overrides]]
+module = "warden.core.*"
+disallow_any_decorated = true
+
+[[tool.mypy.overrides]]
+module = "blake3"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF", "N", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

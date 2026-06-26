@@ -1,0 +1,652 @@
+================================================================================
+ WARDEN
+ A Runtime Trust Layer for LLM Agents
+
+ Information-Flow Control + Capability Enforcement at the tool boundary,
+ built on a provenance graph that also yields deterministic replay.
+
+ Technical Design Document / RFC
+ Version: 0.2 (supersedes v0.1)
+ Status: Proposed
+ License (intended): Apache-2.0
+
+ CHANGE LOG (v0.1 -> v0.2)
+   * Reframed: the SECURITY layer (IFC + capabilities) is the headline and the
+     defensible contribution. Deterministic replay is reframed from a co-equal
+     pillar to the TEST/FORENSICS HARNESS the security layer needs anyway.
+   * Build order reversed: ship the reference monitor first; replay is internal
+     substrate that also happens to be a debugger.
+   * Prior art rewritten after GitHub due diligence: the agent record/replay/
+     debugger space is now CROWDED (agent-replay, agent-lens, mcpruntime,
+     AgentOps, langchain-replay, agent-vcr). Runtime IFC enforcement as a
+     general library is still UNOCCUPIED outside research. Positioning updated
+     accordingly.
+================================================================================
+
+--------------------------------------------------------------------------------
+ 0. TL;DR
+--------------------------------------------------------------------------------
+Warden is a reference monitor for LLM agents. It brings INFORMATION-FLOW CONTROL
+(IFC) and CAPABILITY-BASED ACCESS CONTROL to arbitrary tool-using agents, so that
+data from untrusted sources can never drive a consequential action and
+confidential data can never reach an unauthorized sink. It is framework-agnostic
+and local-first.
+
+The hard, unsolved, defensible part is that runtime IFC enforcement for general
+agents EXISTS ONLY AS RESEARCH today (CaMeL, FIDES, RTBAS, NeuroTaint). There is
+no ergonomic, `pip install`-able library that lets a working engineer wrap their
+existing tools and get provable-style flow guarantees. Warden is that library.
+
+To enforce IFC you must attach a label to every value and propagate it along the
+agent's data-flow graph. Warden represents that graph as a content-addressed DAG
+of (state, call, result) nodes. The same structure, for free, gives DETERMINISTIC
+REPLAY, FORK, and DIFF. Warden uses replay as the TEST HARNESS for the security
+layer (capture an attack once, replay it to prove the policy fires every time)
+and as a FORENSICS artifact (the same provenance edges explain exactly how
+tainted bytes reached a sink). Replay is the harness, not the headline.
+
+--------------------------------------------------------------------------------
+ 1. THE IDEA
+--------------------------------------------------------------------------------
+1.1  The defect that defines the project
+------------------------------------------
+An LLM consumes "instructions" (the developer prompt) and "data" (tool outputs,
+documents, emails, web pages) in ONE undifferentiated token stream. It has no
+formal boundary between the two, so it cannot tell a legitimate order from one an
+attacker hid inside data. Any value that has touched untrusted content must be
+treated as attacker-controlled from that point forward. [OWASP1][W1]
+
+1.2  The principled fix, and why it is the product
+---------------------------------------------------
+The correct defense is not to "detect bad prompts" (a probabilistic filter that
+attackers evade); it is classical security engineering:
+  * INFORMATION-FLOW CONTROL: label every value with integrity (how trusted) and
+    confidentiality (who may see it); propagate labels; forbid flows that violate
+    a lattice policy. (Denning & Denning, 1977.)            [DENNING]
+  * CAPABILITY-BASED ACCESS CONTROL: a privileged action is permitted only when
+    presented with the right capability/label on its arguments.
+  * COMPLETE MEDIATION + REFERENCE MONITOR: one unbypassable checkpoint mediates
+    every consequential action. (Saltzer & Schroeder.)
+
+This works (CaMeL, FIDES; Section 2.4) but is locked in research code. Productizing
+it as a framework-agnostic runtime is Warden's core contribution.
+
+1.3  The thesis: provenance is the shared substrate
+----------------------------------------------------
+Enforcing IFC REQUIRES a provenance graph: which sources produced each value, and
+how values combined. Warden builds that graph once, content-addressed. Two
+readings fall out of one structure:
+
+  PRIMARY  (the product)  — read the graph as a DATA-FLOW graph: propagate labels,
+                            evaluate capability policy at sinks, block violations,
+                            explain them with the provenance path.
+
+  SECONDARY (the harness) — read the same graph as an EXECUTION TRACE: re-derive
+                            deterministic nodes, substitute recorded nondeterministic
+                            ones -> replay, fork, diff, counterfactual injection.
+
+OS analogy: Warden is a reference monitor (SELinux-for-agent-tools) whose audit
+log happens to be a record/replay trace (rr / WinDbg TTD). The audit log is what
+you use to TEST and EXPLAIN the monitor.
+
+--------------------------------------------------------------------------------
+ 2. PROBLEM & MOTIVATION  (PROOFS & FACTS)
+--------------------------------------------------------------------------------
+
+2.1  The "lethal trifecta"
+---------------------------
+An agent that combines (1) access to private data, (2) exposure to untrusted
+content, and (3) the ability to act/communicate externally can be coerced by
+attacker content into exfiltration or unauthorized action. Once untrusted tokens
+enter, the attacker should be assumed to control what happens next; the agent must
+be CONSTRAINED so that ingestion of untrusted input cannot trigger consequential
+actions. [W1]
+
+2.2  Evidence this is THE problem
+----------------------------------
+  * Prompt injection has held #1 on the OWASP Top 10 for LLM Applications since
+    the 2023 debut, unchanged in 2025; root cause stated as instructions and data
+    sharing one channel. [OWASP1][OWASP2]
+  * NIST has called indirect prompt injection generative AI's greatest security
+    flaw. [ECHO1]
+  * OWASP added a separate 2025 Top 10 for AGENTIC AI; "Excessive Agency" is its
+    own top-tier risk. Tool access multiplies the blast radius of any injection.
+    [OWASP2]
+
+2.3  It is realized in production: EchoLeak (CVE-2025-32711)
+------------------------------------------------------------
+  * Zero-click indirect prompt injection in Microsoft 365 Copilot: a single
+    crafted email, no user interaction, coerced Copilot into reading internal
+    files and exfiltrating them. CVSS 9.3. First documented weaponized
+    exfiltration in a production LLM system; tens of millions of users.
+    [ECHO1][ECHO2][ECHO3]
+  * Mechanism named "LLM Scope Violation": untrusted external input causes the
+    model to access and disclose privileged data. This is the trifecta. [ECHO3]
+  * Forensics gap (motivates Warden's harness): the attack left no traditional
+    artifacts and evaded EDR/SIEM; detecting it required agent-level logging that
+    did not exist. [ECHO5]
+
+2.4  The popular defenses fail; the principled one is proven but un-productized
+-------------------------------------------------------------------------------
+  SCANNERS (LLM Guard, Lakera, NeMo Guardrails, Vigil, Garak) try to DETECT
+  injection. They are bypassable: ~100% evasion reported against Azure Prompt
+  Shield and Meta Prompt Guard. Wrong tool for a flow property. [SEC1][SEC3]
+
+  IFC / CAPABILITIES (proven):
+   * CaMeL (DeepMind, 2025): privileged LLM emits a restricted program; a
+     quarantined LLM handles untrusted content without tool access; a custom
+     interpreter tracks provenance and enforces capability policy. ~77% of
+     AgentDojo tasks completed WITH provable security vs ~84% undefended (a ~7
+     point utility cost). Open-sourced. Inspired by CFI (Abadi 2009), Access
+     Control, IFC (Denning 1977). [CAMEL1][CAMEL2][CAMEL3]
+   * FIDES (Microsoft, 2025): confidentiality + integrity labels, dynamic
+     taint-tracking, deterministic policy enforcement, plus primitives for
+     selectively hiding/revealing information. Reported to stop all injections in
+     internal evaluation. [FIDES1][FIDES2]
+   * RTBAS (2025): tool-based agent system with taint tracking; halts for user
+     confirmation when a tool call's labels violate the flow policy. [RTBAS]
+   * NeuroTaint / "Ghost in the Agent" (2026): argues classical taint analysis
+     fails for LLMs because propagation is governed by probabilistic NL reasoning
+     (explicit content transfer + semantic transformation + causal influence +
+     cross-session persistence); ships a research framework + TaintBench (400
+     scenarios, 20 frameworks). [NEURO]
+  All of the above are RESEARCH ARTIFACTS, not general libraries.
+
+2.5  Due diligence: what is (and is not) on GitHub today
+---------------------------------------------------------
+This is the load-bearing section. Conclusions drove the v0.2 reframing.
+
+  THE DEBUGGER / REPLAY SPACE IS CROWDED (do NOT headline it):
+   * clay-good/agent-replay — 100% local, SQLite CLI for time-travel debugging:
+     replay traces, diff (incl. AI-explained divergence), fork-from-step with
+     modified input, plus eval/"safety guardrails" on tool use. CLOSEST overlap.
+     Its "guardrails," however, are POST-HOC trace evaluations (rules + AI), not
+     runtime IFC; it is a CLI, not a wrap-your-agent library; no taint/capability
+     model. [GH-AR]
+   * dreadnode/agent-lens — trajectory capture (ATIF JSON), shadow-git per-step
+     diffs, session forking, resampling/intervention (edit assistant text, tool
+     results, or system prompts and resample), turn-level replay. Counterfactual-
+     like. But Claude-Code-focused, research/interpretability tooling, ~104 stars;
+     no security enforcement. [GH-AL][GH-AL2]
+   * TJKlein/mcpruntime — execution runtime with time-travel debugging (log,
+     rewind, fork, resume_from, JSONL, CLI playback). Sandbox runtime, not a
+     framework-agnostic wrapper. [GH-MR]
+   * AgentOps (YC W24) — session replay + time-travel debugging across 400+
+     frameworks with a step execution graph and guardrails. Observability
+     platform; guardrails are monitoring/eval, not IFC. [GH-AO][GH-AWE]
+   * sixty-north/langchain-replay — records LangChain/LangGraph DECISIONS and
+     replays them while executing tools. LangChain-only; no fork/diff/IFC. [GH-LR]
+   * Jarvis2021/agent-vcr — records/replays MCP JSON-RPC traffic with a diff
+     feature (Python + TS). MCP regression testing, not trajectory debugging.
+     [GH-VCR]
+   * HTTP-level VCR for LLM tests: vcr-langchain, pytest-recording, llm-vcr-tests,
+     req_cassette. Flat cassettes, not graphs. [GH-VL]
+
+  THE RUNTIME IFC ENFORCEMENT SPACE IS ESSENTIALLY EMPTY (the moat):
+   * The only practical GitHub LIBRARY nearby, HeadyZhang/agent-audit, is a
+     DIFFERENT CATEGORY: a STATIC security scanner (intra-procedural taint
+     analysis on source, MCP config auditing, 51 rules mapped to OWASP Agentic
+     Top 10) — i.e. Bandit/Semgrep-for-agents that finds vulns in code. It does
+     NOT enforce policy on live data at runtime. [GH-AA]
+   * Every runtime enforcer (CaMeL, FIDES, RTBAS, NeuroTaint) is research. The
+     practitioner community is openly asking whether taint-style policy engines
+     exist in real agent stacks "beyond research prototypes." [W1]
+   * No project pairs runtime IFC/taint enforcement WITH record/replay on one
+     shared provenance graph. The debuggers carry no labels; the IFC research
+     ships no fork/diff tooling. The combination is unoccupied.
+
+2.6  Why the harness is still worth having (market signal)
+-----------------------------------------------------------
+The replay/observability category is well capitalized (Arize $70M Series C, Feb
+2025; Braintrust $80M Series B at $800M, Feb 2026; ClickHouse acquired Langfuse,
+Jan 2026), which is why Warden ships replay at all — but as substrate. Warden's
+replay differentiates on what the debuggers lack and IFC needs anyway: a
+PROVENANCE-CARRYING, content-addressed graph, not flat SQLite/JSONL traces.
+[MKT1][MKT2][MKT3]
+
+(Scope note: structural "contract + repair" on tool calls is commoditized —
+Pydantic AI validates args and retries via ModelRetry; Instructor/Guardrails
+reask. Warden delegates that and targets cross-call/stateful FLOW invariants.
+[CONTRACT1][CONTRACT2])
+
+--------------------------------------------------------------------------------
+ 3. GOALS / NON-GOALS
+--------------------------------------------------------------------------------
+GOALS
+  G1. Be the runtime IFC + capability enforcement layer for ARBITRARY agents
+      (the empty quadrant), framework-agnostic, local-first, fail-closed.
+  G2. Provable-style guarantees: no privileged sink executes on arguments whose
+      labels violate policy; confidential data cannot reach a non-permitted sink.
+  G3. Explainability: every block is justified by a provenance path.
+  G4. Provide deterministic replay/fork/diff AS THE TEST + FORENSICS HARNESS for
+      G1-G3 (and as a usable debugger).
+  G5. Keep utility cost low (label creep is the field's #1 practical failure;
+      Section 8) via variable/reference-based tracking and safe declassification.
+
+NON-GOALS
+  N1. Not a scanner (no heuristic "is this prompt malicious?").
+  N2. Not "another time-travel debugger." Replay is substrate; we will not
+      compete on debugger features with agent-replay/agent-lens.
+  N3. Not a post-hoc trace evaluator. Enforcement is at runtime, before the side
+      effect, not a check run on a trace afterward.
+  N4. Not a structural arg/output validator (delegated to Pydantic/Instructor).
+  N5. Not a model (no fine-tuning; defense is system-level, model-agnostic).
+  N6. Does not claim to "solve" injection; it bounds blast radius and makes
+      exploitation provably hard GIVEN correct policies.
+
+--------------------------------------------------------------------------------
+ 4. DESIGN PRINCIPLES
+--------------------------------------------------------------------------------
+  P1. ONE BOUNDARY. All labeling, enforcement, and capture happen at the
+      agent/world interface (model client + registered tools). No scattered hooks.
+  P2. COMPLETE MEDIATION. Every privileged action passes the reference monitor
+      before its side effect runs. No bypass path exists by construction.
+  P3. FAIL-CLOSED. Unlabeled value at a sensitive sink -> deny. Default-deny on
+      consequential capabilities. Unrecorded call on replay -> raise.
+  P4. LATTICE DISCIPLINE. Integrity and confidentiality form lattices; combining
+      values JOINS labels; flows that violate the lattice are forbidden.
+  P5. EXPLAINABILITY IS MANDATORY. A denial without a provenance path is a bug.
+  P6. DETERMINISM BY SUBTRACTION. Record only nondeterministic inputs; re-derive
+      the rest. (Classic record/replay principle.) [REPLAY3]
+  P7. NO SILENT SIDE EFFECTS ON REPLAY. World-mutating tools are never re-run
+      during replay; their recorded result is returned. This makes replay safe to
+      execute thousands of times against attack recordings.
+  P8. MINIMIZE LABEL CREEP. Prefer variable/reference-based tracking over naive
+      whole-context tainting; provide principled, audited declassification.
+
+--------------------------------------------------------------------------------
+ 5. ARCHITECTURE & DESIGN
+--------------------------------------------------------------------------------
+
+5.1  System overview (security layer primary; harness secondary)
+-----------------------------------------------------------------
+
+        +-------------------------------------------------------------+
+        |                 USER / AGENT LOGIC                          |
+        |       (any framework, or raw provider SDK calls)            |
+        +----------------------------+--------------------------------+
+                                     |  every LLM call / tool call
+                                     v
+        +=============================================================+
+        |                   WARDEN INTERCEPTION                       |
+        |   model shim (chat/stream)     tool shim (@warden.tool)     |
+        +------+-----------------------------------------------+------+
+               |                                               |
+   label + policy tap (PRIMARY)                 record/replay tap (HARNESS)
+               |                                               |
+               v                                               v
+   +-------------------------------+        +--------------------------------+
+   |  THE GUARD  (product)          |       |  THE HARNESS  (substrate)       |
+   |  - label algebra (5.4)         |       |  - record / replay (5.6)        |
+   |  - taint propagation           |       |  - fork / suffix-replay         |
+   |  - capability policy engine    |       |  - trajectory diff              |
+   |  - reference monitor @ sinks   |       |  - counterfactual injection     |
+   |  - dual-plane (opt) / declass. |       |    (= adversarial test harness) |
+   +---------------+---------------+        +----------------+---------------+
+                   |                                          |
+                   +------------------+   +-------------------+
+                                      v   v
+                          +-------------------------------+
+                          |        WARDEN CORE            |
+                          |  Provenance Graph (Merkle DAG)|
+                          |  content-addressed nodes      |
+                          |  causal edges + labels        |
+                          |  on-disk store + cassettes    |
+                          +-------------------------------+
+
+5.2  Warden Core — the provenance graph
+----------------------------------------
+A run is a directed acyclic graph. Node kinds:
+    UserInput | SystemPrompt | LLMRequest | LLMResponse |
+    ToolCall  | ToolResult   | AgentState(Checkpoint)   | FinalOutput
+
+Each node is CONTENT-ADDRESSED: id = hash(canonical_serialization(node)) (git/
+Merkle-DAG style). Consequences:
+  * Identical prefixes across runs dedupe; forks are O(1) (no copy).
+  * Trajectory equality is hash equality; first divergence between two runs is
+    the first non-matching node id (diffing bootstraps for free).
+
+Edges are CAUSAL ("derived-from"). They serve BOTH readings:
+  * GUARD walks them to propagate labels (a value's label = JOIN of its parents').
+  * HARNESS walks them to replay (re-derive deterministic nodes, substitute
+    recorded ones).
+
+Per-node metadata: security labels (provenance set, integrity, confidentiality)
+AND replay payload (recorded bytes, params, latency, captured clock/RNG state for
+nondeterministic nodes).
+
+Canonicalization (critical for stable hashing): normalize ephemeral fields
+(tool_call_id, request_id, timestamps -> stable surrogates); sort JSON keys; fix
+float formatting; documented whitespace rule; exclude latency/clock from identity.
+
+5.3  Interception layer
+------------------------
+Two modes (mirrors proxy-vs-SDK ecosystem tradeoff):
+  MODE 1 — Transport proxy (zero code change): OpenAI/Anthropic-compatible
+           base_url; record + enforce in the middle.
+  MODE 2 — In-process shim (fine-grained): wrap the model client; register tools
+           via @warden.tool for per-value labels and richer policy.
+The shim is the ONLY place labeling/enforcement/capture occur (P1).
+
+5.4  THE GUARD (primary) — IFC + capability enforcement
+--------------------------------------------------------
+LABEL ALGEBRA. Every value carries:
+  provenance      : set[SourceId]           (which sources produced/touched it)
+  integrity       : lattice value           (TRUSTED >= UNTRUSTED, extensible)
+  confidentiality : lattice value / readers (PUBLIC <= INTERNAL <= SECRET, or a
+                                              principal set)
+Following FIDES (confidentiality + integrity) and CaMeL (capabilities-as-metadata).
+[FIDES1][CAMEL1]
+
+PROPAGATION (Denning lattice). Deriving a value JOINS input labels:
+  integrity:        trusted JOIN untrusted = untrusted   (taint spreads down)
+  confidentiality:  public  JOIN secret    = secret      (only rises)
+Implemented at the boundary: tool results are labeled by source on entry; labels
+propagate along Core edges. To MITIGATE LABEL CREEP (Section 8), untrusted blobs
+are bound to opaque REFERENCE HANDLES ($doc1) and tracked as variables rather than
+smearing taint across the entire context. [SURVEY]
+
+CAPABILITY POLICY ENGINE. Policies are declarative predicates over
+(action, args+labels, context). Examples:
+  deny send_email if recipient.integrity != TRUSTED       # dest must be user-origin
+  deny http_post  if body.confidentiality > PUBLIC        # block exfiltration
+  deny exec_code  if any_arg.integrity == UNTRUSTED       # no code from web text
+Default-deny on consequential capabilities (P3). Policies are versioned, compiled,
+and unit-testable.
+
+REFERENCE MONITOR (the sink gate). A single mediation point fronts every
+privileged tool. BEFORE the side effect runs, it evaluates applicable policy
+against the call's argument labels (complete mediation, P2). Violation -> raise
+WardenPolicyViolation carrying the provenance path (P5). This is the structural
+defense against the confused-deputy/exfiltration pattern behind EchoLeak.
+
+DUAL-PLANE EXECUTION (advanced, opt-in) for maximal guarantees:
+  * PLANNER (P-LLM) sees task structure, labels, and opaque reference handles —
+    never raw untrusted content — so injected text cannot alter control flow.
+  * QUARANTINED path (Q-LLM) processes untrusted content but has NO tool access;
+    returns labeled values bound to handles.
+  Supports STATIC planning (plan-then-execute, CaMeL-style) and ITERATIVE
+  planning (step-by-step with redacted history, Fides-style). [CAMEL1][DUAL1]
+
+SELECTIVE REVEAL (declassification). Explicit, audited points where
+confidentiality may be lowered (e.g. user confirms an action). Each
+declassification is a node in the graph; principled declassification is the
+documented remedy for label creep. Mirrors FIDES hide/reveal. [FIDES1][SURVEY]
+
+5.5  Public API sketch (Guard-first)
+-------------------------------------
+    import warden
+    wd = warden.Warden(store="./.warden")           # local-first
+
+    @wd.tool(integrity_source="untrusted")          # web content is tainted
+    def fetch_url(url: str) -> str: ...
+
+    @wd.tool
+    def send_email(to: str, body: str) -> None: ...
+
+    wd.policy("""
+      deny send_email if to.integrity   != TRUSTED
+      deny http_post  if body.confidentiality > PUBLIC
+      deny exec_code  if any_arg.integrity == UNTRUSTED
+    """)
+
+    with wd.guard():                                # reference monitor ACTIVE
+        my_agent(task)                              # any framework
+        # -> raises WardenPolicyViolation (with provenance path) on abuse
+
+5.6  THE HARNESS (secondary) — record / replay / fork / diff
+-------------------------------------------------------------
+DETERMINISM MODEL. An agent's nondeterministic surface = LLM outputs, tool/IO
+results, wall-clock time, randomness, and (for async/parallel) scheduling. Record
+only these; re-derive the rest (P6). [REPLAY3]
+
+RECORD: at each boundary, store request->response keyed by content-hash of (model,
+params, full messages, tool schema) — a content-addressed cassette; store stream
+chunks + assembled message; capture clock + RNG state; append nodes + edges.
+REPLAY: re-run the agent's own deterministic code; substitute recorded responses
+by request hash; cache MISS -> raise (fail-closed, P3); freeze clock, reseed RNG;
+world-mutating tools are NOT re-executed (P7). [REPLAY2]
+FORK + SUFFIX REPLAY: fork(node) shares the immutable prefix (O(1)); re-run from
+the node; upstream hits cache, downstream live or cached per mode.
+DIFF: content-addressing gives the divergence node directly (first differing id);
+a structural step-diff over the suffix classifies WHAT differed (prompt? sampled
+tokens? tool result?) and the downstream blast radius. Human- and machine-readable.
+COUNTERFACTUAL INJECTION: substitute a value at a node (e.g. inject an attacker
+string into a ToolResult) then suffix-replay. This is the GUARD's adversarial test
+harness (5.7).
+
+5.7  How the harness serves the guard (the payoff)
+---------------------------------------------------
+  * SECURITY REGRESSION TESTS: capture an attack run once; replay deterministically
+    to assert the policy fires every time. (Possible only because P7 makes replay
+    side-effect-free.)
+  * EXPLANATION ENGINE: the harness's "derived-from" edges ARE the guard's
+    data-flow graph; a denial renders as a path ("tainted at node 2 (web fetch) ->
+    joined into recipient at node 5 -> send_email#integrity blocked").
+  * ADVERSARIAL FUZZING: counterfactual injection + assert containment.
+  * FORENSICS: ship recording (what happened) + taint trail (how untrusted bytes
+    reached a sink) — exactly the agent-level artifact missing in EchoLeak
+    post-mortems. [ECHO5]
+
+5.8  On-disk format
+--------------------
+  ./.warden/objects/<hh>/<hash>   # content-addressed nodes (zstd)
+  ./.warden/runs/<id>.json        # node-id list + root + metadata
+  ./.warden/cassettes/<id>/       # recorded request->response payloads
+  ./.warden/policies/<name>.wpol  # compiled policy
+  Export: OpenTelemetry spans (coexist with existing observability).
+
+5.9  THREAT MODEL
+------------------
+ASSUMPTIONS: the model is untrusted re instruction-following on untrusted data
+(we assume it CAN be injected). The Warden runtime, policy file, and user/system
+prompt are trusted. Tools honestly declare their integrity source.
+ATTACKER (in scope): inject arbitrary instructions into any ingested data; attempt
+exfiltration via any registered egress; launder data across multiple tool calls.
+GUARANTEES (given correct policies): no privileged sink runs on policy-violating
+labels (complete mediation, fail-closed); confidential data cannot reach a
+non-permitted sink; in dual-plane mode, injected text cannot alter planner control
+flow.
+OUT OF SCOPE / RESIDUAL RISK (state in README): policy bugs (a missing rule);
+covert/side channels (timing, error text) — partial mitigation; a tool that
+mislabels its integrity source; iterative-planning leakage classes from the
+dual-LLM literature [DUAL1]; SEMANTIC taint that is causal but not lexical, which
+classical taint misses [NEURO]. Warden bounds and explains the trifecta; it does
+not "solve" injection.
+
+--------------------------------------------------------------------------------
+ 6. TESTING & EVALUATION
+--------------------------------------------------------------------------------
+PRIMARY (security) — the numbers that define the repo:
+  6.1 AgentDojo: the standard dynamic prompt-injection benchmark (97 realistic
+      tasks + 629 security cases, extensible to adaptive attacks). Report all
+      three and the tradeoff curve: UTILITY (benign success), UTILITY-UNDER-
+      ATTACK, and ATTACK SUCCESS RATE (ASR). Target: drive ASR toward 0 with
+      bounded utility loss. Baselines to match/beat (cite in README): undefended
+      (high utility, high ASR); CaMeL (~77% with-security vs ~84% baseline); FIDES
+      (all attacks stopped, internal). Evaluate ADAPTIVE attacks (attacker who
+      knows the policies), since static ASR overstates robustness. [AGENTDOJO][CAMEL3][FIDES1]
+  6.2 Taint propagation correctness: evaluate source-to-sink propagation against
+      TaintBench-style scenarios (explicit lexical, semantic multi-hop, implicit
+      control-influence, cross-session). [NEURO]
+  6.3 LABEL-CREEP / FALSE-POSITIVE rate (first-class quality metric): run the
+      benign suite with the guard ON vs OFF; assert IDENTICAL behavior on benign
+      tasks. Over-tainting that breaks legitimate flows is a release-blocking bug
+      (utility cost is the whole game; cf. CaMeL's ~7-point cost, FIDES's
+      declassification primitives). [SURVEY]
+  6.4 EchoLeak-class regression suite: untrusted email instructs exfiltration via
+      (a) outbound link, (b) auto-fetched image URL, (c) benign-looking POST.
+      Assert the monitor blocks each egress with a provenance trace. Cross-call
+      laundering: assert taint SURVIVES summarize/reformat. [ECHO2][ECHO3]
+
+SUPPORTING (harness) — must be byte-stable to be trustworthy:
+  6.5 Property tests (Hypothesis): DETERMINISM hashes(replay(r))==hashes(r);
+      FORK IDENTITY (no-op fork => identical suffix); LABEL MONOTONICITY
+      (label(derived) >= JOIN(parents), except via an explicit declass node);
+      MEDIATION COMPLETENESS (no path reaches a sink without the monitor —
+      static check + runtime assertion).
+  6.6 Determinism fidelity: golden cassettes for multi-step loops, STREAMING,
+      async/parallel scheduling, time-dependent and RNG-dependent tools;
+      canonicalization tests (shuffled JSON keys / differing tool_call_id ->
+      same node hash).
+
+NON-FUNCTIONAL:
+  6.7 Overhead budget: GUARD = in-process predicate checks (sub-ms) + O(parents)
+      propagation; set an explicit budget and gate. RECORD overhead small/bounded
+      (boundary I/O only). REPLAY faster than live (no network). Benchmark vs a
+      no-Warden control. [REPLAY3]
+  6.8 CI gates: strict typing (mypy/pyright, zero core ignores); coverage on Core
+      + the sink gate; property tests every PR; AgentDojo ASR regression gate;
+      false-positive (label-creep) regression gate; determinism byte-stability
+      gate; overhead regression gate.
+
+--------------------------------------------------------------------------------
+ 7. MILESTONES / BUILD ORDER  (ship the moat first)
+--------------------------------------------------------------------------------
+  M0  CORE: content-addressed provenance graph + canonicalization + on-disk store.
+      (Shared substrate; built once.)
+  M1  THE GUARD (FIRST PUBLIC RELEASE; the headline): label algebra + propagation
+      + reference-based tracking + capability policy DSL + reference monitor at
+      the tool boundary + AgentDojo harness + EchoLeak regression suite + the
+      label-creep/false-positive metric. Publish AgentDojo numbers vs CaMeL/FIDES.
+  M2  THE HARNESS: record/replay/fork/diff/counterfactual, wired as the guard's
+      test + forensics harness (and a usable debugger). NOT marketed as a
+      standalone debugger (Section 2.5).
+  M3  DUAL-PLANE (advanced): P-LLM/Q-LLM static + iterative planning; selective
+      reveal/declassification.
+  M4  ADAPTERS: LangGraph / OpenAI Agents SDK / Pydantic AI / CrewAI shims; OTel
+      export.
+
+Rationale for the reversal vs v0.1: the debugger space filled up in 2026
+(agent-replay, agent-lens, AgentOps, mcpruntime). The defensible, unoccupied work
+is the reference monitor. Ship it first; let replay land as the harness that tests
+and explains it.
+
+--------------------------------------------------------------------------------
+ 8. RISKS & MITIGATIONS
+--------------------------------------------------------------------------------
+  R1 LABEL CREEP / over-tainting (the field's #1 practical failure: conservative
+     propagation renders agents unusable). -> reference/variable-based tracking
+     instead of whole-context taint; principled, audited declassification;
+     false-positive rate as a release gate (6.3). [SURVEY]
+  R2 Security correctness is high-stakes. -> public AgentDojo benchmarking; honest
+     LIMITATIONS section; never claim "solved."
+  R3 Semantic taint (causal influence without lexical transfer) escapes classical
+     taint. -> model-assisted propagation checks on traces as an optional layer;
+     document the boundary. [NEURO]
+  R4 Scope creep (building two products). -> M1 (guard) ships and stands alone
+     BEFORE M2 (harness); strictly layered.
+  R5 Perceived overlap with agent-replay/agent-lens. -> positioning: Warden is a
+     reference monitor, not a debugger; the harness is provenance-carrying (labels),
+     which their flat traces are not.
+  R6 Utility cost too high to adopt. -> measure and publish the utility/security
+     tradeoff curve; target parity-or-better with CaMeL's ~7-point cost.
+
+--------------------------------------------------------------------------------
+ 9. PRIOR ART (honest positioning)
+--------------------------------------------------------------------------------
+A. RUNTIME IFC / CAPABILITY ENFORCEMENT (Warden's category — research only):
+   CaMeL [CAMEL1], FIDES [FIDES1], RTBAS [RTBAS], NeuroTaint [NEURO]. Proven, not
+   productized. agent-audit [GH-AA] is a STATIC scanner (different category:
+   finds code vulns, does not enforce at runtime). Scanners (LLM Guard, Lakera,
+   NeMo) are bypassable and orthogonal [SEC1][SEC3].
+
+B. RECORD/REPLAY/DEBUGGER (crowded; Warden uses this as substrate, not headline):
+   clay-good/agent-replay (local replay/fork/diff + post-hoc guardrails) [GH-AR];
+   dreadnode/agent-lens (forking + intervention/resampling, Claude-Code) [GH-AL];
+   TJKlein/mcpruntime (runtime time-travel) [GH-MR]; AgentOps (platform) [GH-AO];
+   sixty-north/langchain-replay (LangChain decisions) [GH-LR]; Jarvis2021/agent-vcr
+   (MCP traffic + diff) [GH-VCR]; HTTP VCR libs [GH-VL]; LangSmith/LangGraph
+   (framework-locked) [MKT4]. None carry security labels or enforce flows.
+
+C. BENCHMARKS: AgentDojo [AGENTDOJO], TaintBench [NEURO] — what Warden evaluates
+   ON, not defenses.
+
+D. STRUCTURAL VALIDATION: Pydantic AI / Instructor / Guardrails [CONTRACT1]
+   [CONTRACT2] — Warden delegates this; targets cross-call FLOW invariants.
+
+POSITIONING. Warden's unique cell = (runtime IFC + capability enforcement) on a
+(provenance-carrying, content-addressed graph) that ALSO yields replay used as the
+test/forensics harness. Category A has no general library; category B carries no
+labels. No project occupies the intersection.
+
+--------------------------------------------------------------------------------
+ 10. REFERENCES
+--------------------------------------------------------------------------------
+[OWASP1]   OWASP Top 10 for LLM Apps — LLM01 Prompt Injection.
+           https://genai.owasp.org/llmrisk/llm01-prompt-injection/
+[OWASP2]   OWASP Top 10 for LLM Apps (2025), analysis.
+           https://aembit.io/blog/owasp-top-10-llm-risks-explained/
+[W1]       Willison, "The lethal trifecta for AI agents."
+           https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/
+[ECHO1]    Reddy & Gujral, "EchoLeak: The First Real-World Zero-Click Prompt
+           Injection Exploit in a Production LLM System." arXiv:2509.10540.
+           https://arxiv.org/abs/2509.10540
+[ECHO2]    Sentra, "EchoLeak (CVE-2025-32711)."
+           https://sentra.io/blog/copilot-echoleak-prompt-injection
+[ECHO3]    SOC Prime, "CVE-2025-32711 'EchoLeak' — LLM Scope Violation."
+           https://socprime.com/blog/cve-2025-32711-zero-click-ai-vulnerability/
+[ECHO5]    CovertSwarm, "EchoLeak: The Zero-Click Copilot Exploit."
+           https://www.covertswarm.com/post/echoleak-copilot-exploit
+[CAMEL1]   Debenedetti et al. (DeepMind), "Defeating Prompt Injections by Design"
+           (CaMeL). arXiv:2503.18813. https://arxiv.org/pdf/2503.18813
+[CAMEL2]   CaMeL source. https://github.com/google-research/camel-prompt-injection
+[CAMEL3]   Zylos Research, "Indirect Prompt Injection: Defenses, 2026 SOTA"
+           (CaMeL ~77% vs ~84%; FIDES results).
+           https://zylos.ai/research/2026-04-12-indirect-prompt-injection-defenses-agents-untrusted-content/
+[FIDES1]   Costa, Koepf et al. (Microsoft), "Securing AI Agents with Information-
+           Flow Control" (FIDES). arXiv:2505.23643. https://arxiv.org/pdf/2505.23643
+[FIDES2]   Microsoft Research project page.
+           https://www.microsoft.com/en-us/research/publication/securing-ai-agents-with-information-flow-control/
+[DUAL1]    "CaMeLs Can Use Computers Too" (static vs iterative dual-LLM).
+           arXiv:2601.09923. https://arxiv.org/pdf/2601.09923
+[RTBAS]    "RTBAS: Defending LLM Agents Against Prompt Injection and Privacy
+           Leakage." arXiv:2502.08966. https://arxiv.org/pdf/2502.08966
+[NEURO]    "Ghost in the Agent: Redefining Information Flow Tracking for LLM
+           Agents" (NeuroTaint, TaintBench). arXiv:2604.23374.
+           https://arxiv.org/abs/2604.23374
+[SURVEY]   "The Attack and Defense Landscape of Agentic AI: A Comprehensive
+           Survey" (IFC/taint open challenges: label creep, overhead,
+           declassification). arXiv:2603.11088. https://arxiv.org/pdf/2603.11088
+[DENNING]  Denning & Denning, "Certification of Programs for Secure Information
+           Flow" (1977) — the lattice IFC model (cited by CaMeL).
+[AGENTDOJO] Debenedetti et al., "AgentDojo." arXiv:2406.13352.
+           https://arxiv.org/pdf/2406.13352
+[REPLAY2]  TianPan, "Deterministic Replay..." (fail-loudly-on-unrecorded-call).
+           https://tianpan.co/blog/2026-04-12-deterministic-replay-debugging-non-deterministic-ai-agents
+[REPLAY3]  "Get Experience from Practice: LLM Agents with Record & Replay" (R&R
+           principle). arXiv:2505.17716. https://arxiv.org/pdf/2505.17716
+[SEC1]     "LLM Guard 2026." https://appsecsanta.com/llm-guard
+[SEC3]     Introl, "LLM Security: Prompt Injection Defense" (~100% scanner
+           evasion). https://introl.com/blog/llm-security-prompt-injection-defense-production-guide-2025
+[GH-AR]    clay-good/agent-replay. https://github.com/clay-good/agent-replay
+[GH-AL]    dreadnode/agent-lens. https://github.com/dreadnode/agent-lens
+[GH-AL2]   Starlog review of agent-lens.
+           https://starlog.is/articles/ai-agents/dreadnode-agent-lens/
+[GH-MR]    TJKlein/mcpruntime. https://github.com/TJKlein/mcpruntime
+[GH-AO]    Galileo, "8 Best AI Agent Debugging Tools" (AgentOps time-travel +
+           guardrails). https://galileo.ai/blog/best-ai-agent-debugging-root-cause-analysis-tools
+[GH-AWE]   ai-boost/awesome-harness-engineering (AgentOps, Future AGI, etc.).
+           https://github.com/ai-boost/awesome-harness-engineering
+[GH-LR]    sixty-north/langchain-replay. https://github.com/sixty-north/langchain-replay
+[GH-VCR]   Jarvis2021/agent-vcr. https://github.com/Jarvis2021/agent-vcr
+[GH-VL]    amosjyng/vcr-langchain. https://github.com/amosjyng/vcr-langchain
+[GH-AA]    HeadyZhang/agent-audit (static scanner; OWASP Agentic Top 10).
+           https://github.com/HeadyZhang/agent-audit
+[MKT1]     Maxim AI observability comparison (Arize $70M Series C).
+           https://www.getmaxim.ai/articles/5-ai-observability-platforms-compared-maxim-ai-arize-helicone-braintrust-langfuse/
+[MKT2]     TECHSY, "9 AI Observability Tools 2026" (Braintrust $80M, $800M).
+           https://techsy.io/en/blog/best-ai-observability-platforms
+[MKT3]     Latitude comparison (Langfuse acquired by ClickHouse).
+           https://latitude.so/blog/best-llm-observability-tools-agents-latitude-vs-langfuse-langsmith
+[MKT4]     DigitalApplied, "Agent Observability 2026" (LangSmith framework lock-in).
+           https://www.digitalapplied.com/blog/agent-observability-platforms-langsmith-langfuse-arize-2026
+[CONTRACT1] Pydantic AI docs (tool-arg validation + ModelRetry).
+           https://ai.pydantic.dev/agent/
+[CONTRACT2] ToolHalla, "AI Agent Guardrails & Output Validation in 2026"
+           (Instructor / Guardrails reask).
+           https://toolhalla.ai/blog/ai-agent-guardrails-io-validation-2026
+
+================================================================================
+ END OF DOCUMENT — WARDEN v0.2
+================================================================================
