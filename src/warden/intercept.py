@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, overload
 
 from warden.core import Node, NodeId, NodeKind
+from warden.harness import Recorder
 from warden.labels import Confidentiality, Label, SourceId, Taint, join_all
 from warden.monitor import Monitor
 from warden.policy import Policy, ToolClass, compile_policy
@@ -83,17 +84,19 @@ class Guard:
     every call and returns a labeled Handle.
     """
 
-    __slots__ = ("_monitor", "_strategy")
+    __slots__ = ("_monitor", "_recorder", "_strategy")
 
     def __init__(
         self,
         policy: Policy | str,
         *,
         strategy: PropagationStrategy = WHOLE_CONTEXT,
+        recorder: Recorder | None = None,
     ) -> None:
         compiled = compile_policy(policy) if isinstance(policy, str) else policy
         self._monitor = Monitor(compiled)
         self._strategy = strategy
+        self._recorder = recorder
 
     def source(
         self,
@@ -106,6 +109,8 @@ class Guard:
         """Mint a labeled handle for an external input (the first label boundary)."""
         label = Label(integrity, confidentiality, frozenset(provenance))
         node = Node(NodeKind.USER_INPUT, (), _payload(value))
+        if self._recorder is not None:
+            self._recorder.record_source(node)
         return Handle(node.id, label, value)
 
     def value(self, handle: Handle) -> Any:
@@ -175,11 +180,19 @@ class Guard:
                 # Complete mediation: decide BEFORE the side effect; deny raises.
                 self._monitor.mediate(action, arg_labels)
 
+                # The call node is the content-addressed identity of the REQUEST
+                # (tool + bound arguments) -- the cassette key a replay looks up.
+                call_node = Node(
+                    NodeKind.TOOL_CALL,
+                    tuple(parent_ids),
+                    {"tool": action, "args": _payload(dict(bound.arguments))},
+                )
                 result = func(*bound.args, **bound.kwargs)
-
-                node = Node(NodeKind.TOOL_RESULT, tuple(parent_ids), _payload(result))
-                label = self._strategy.node_label(node, parent_labels, source_label)
-                return Handle(node.id, label, result)
+                result_node = Node(NodeKind.TOOL_RESULT, (call_node.id,), _payload(result))
+                label = self._strategy.node_label(result_node, parent_labels, source_label)
+                if self._recorder is not None:
+                    self._recorder.record_boundary(call_node, result_node)
+                return Handle(result_node.id, label, result)
 
             return wrapper
 

@@ -14,6 +14,7 @@ every call and a denial raises ``WardenPolicyViolation``::
     def send_email(body, recipient): ...
 """
 
+from warden.harness import Recorder, Recording
 from warden.intercept import Guard, Handle
 from warden.labels import Confidentiality, Label, Taint
 from warden.monitor import WardenPolicyViolation
@@ -24,6 +25,8 @@ __all__ = [
     "Guard",
     "Handle",
     "Label",
+    "Recorder",
+    "Recording",
     "Taint",
     "ToolClass",
     "WardenPolicyViolation",
