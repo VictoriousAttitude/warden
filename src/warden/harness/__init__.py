@@ -10,6 +10,19 @@ WARDEN_ARCHITECTURE_v0.1.txt section 10.
 """
 
 from warden.harness.record import BoundaryEvent, Recorder, Recording
-from warden.harness.replay import Replayer, ReplayError
+from warden.harness.replay import (
+    BoundaryOracle,
+    CounterfactualReplayer,
+    Replayer,
+    ReplayError,
+)
 
-__all__ = ["BoundaryEvent", "Recorder", "Recording", "ReplayError", "Replayer"]
+__all__ = [
+    "BoundaryEvent",
+    "BoundaryOracle",
+    "CounterfactualReplayer",
+    "Recorder",
+    "Recording",
+    "ReplayError",
+    "Replayer",
+]

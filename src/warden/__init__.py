@@ -14,7 +14,13 @@ every call and a denial raises ``WardenPolicyViolation``::
     def send_email(body, recipient): ...
 """
 
-from warden.harness import Recorder, Recording, Replayer, ReplayError
+from warden.harness import (
+    CounterfactualReplayer,
+    Recorder,
+    Recording,
+    Replayer,
+    ReplayError,
+)
 from warden.intercept import Guard, Handle
 from warden.labels import Confidentiality, Label, Taint
 from warden.monitor import WardenPolicyViolation
@@ -22,6 +28,7 @@ from warden.policy import ToolClass, compile_policy
 
 __all__ = [
     "Confidentiality",
+    "CounterfactualReplayer",
     "Guard",
     "Handle",
     "Label",

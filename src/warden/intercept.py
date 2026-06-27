@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, overload
 
 from warden.core import CanonicalValue, Node, NodeId, NodeKind
-from warden.harness import Recorder, Replayer
+from warden.harness import BoundaryOracle, Recorder
 from warden.labels import Confidentiality, Label, SourceId, Taint, join_all
 from warden.monitor import Monitor
 from warden.policy import Policy, ToolClass, compile_policy
@@ -102,7 +102,7 @@ class Guard:
         *,
         strategy: PropagationStrategy = WHOLE_CONTEXT,
         recorder: Recorder | None = None,
-        replayer: Replayer | None = None,
+        replayer: BoundaryOracle | None = None,
     ) -> None:
         compiled = compile_policy(policy) if isinstance(policy, str) else policy
         self._monitor = Monitor(compiled)
@@ -208,10 +208,18 @@ class Guard:
                     tuple(parent_ids),
                     {"tool": action, "args": arg_idents},
                 )
-                # On replay, the recorded result is served and the tool never runs
-                # (INV-8); a request not in the cassette fails closed (INV-5).
-                if self._replayer is not None:
-                    result_node = self._replayer.resolve(call_node)
+                # A boundary oracle (replay or counterfactual) may serve the result:
+                # the recorded result is replayed and the tool never runs (INV-8; a
+                # strict Replayer fails closed on a miss, INV-5). When the oracle
+                # returns None -- no recording, or a counterfactual that has diverged --
+                # the tool runs live and we build the result node ourselves.
+                served = (
+                    self._replayer.resolve(call_node)
+                    if self._replayer is not None
+                    else None
+                )
+                if served is not None:
+                    result_node = served
                     result: Any = result_node.payload
                 else:
                     result = func(*bound.args, **bound.kwargs)
