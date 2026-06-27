@@ -34,8 +34,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, overload
 
-from warden.core import Node, NodeId, NodeKind
-from warden.harness import Recorder
+from warden.core import CanonicalValue, Node, NodeId, NodeKind
+from warden.harness import Recorder, Replayer
 from warden.labels import Confidentiality, Label, SourceId, Taint, join_all
 from warden.monitor import Monitor
 from warden.policy import Policy, ToolClass, compile_policy
@@ -76,6 +76,16 @@ def _classify(value: Any) -> tuple[Label, Any, NodeId | None]:
     return Label.bottom(), value, None
 
 
+def _arg_identity(value: Any, parent: NodeId | None) -> str:
+    """Project an argument to its stable identity for the request's content id.
+
+    A handle contributes its provenance node id (content-addressed), so a request
+    derived from a recorded result is byte-identical on replay regardless of the
+    object that carries it. A raw argument contributes its canonical repr.
+    """
+    return parent.hex() if parent is not None else _payload(value)
+
+
 class Guard:
     """A policy plus the in-process registry of tools wrapped through it.
 
@@ -84,7 +94,7 @@ class Guard:
     every call and returns a labeled Handle.
     """
 
-    __slots__ = ("_monitor", "_recorder", "_strategy")
+    __slots__ = ("_monitor", "_recorder", "_replayer", "_strategy")
 
     def __init__(
         self,
@@ -92,11 +102,13 @@ class Guard:
         *,
         strategy: PropagationStrategy = WHOLE_CONTEXT,
         recorder: Recorder | None = None,
+        replayer: Replayer | None = None,
     ) -> None:
         compiled = compile_policy(policy) if isinstance(policy, str) else policy
         self._monitor = Monitor(compiled)
         self._strategy = strategy
         self._recorder = recorder
+        self._replayer = replayer
 
     def source(
         self,
@@ -156,6 +168,7 @@ class Guard:
                 bound = signature.bind(*args, **kwargs)
                 bound.apply_defaults()
                 arg_labels: dict[str, Label] = {}
+                arg_idents: dict[str, CanonicalValue] = {}
                 parent_ids: list[NodeId] = []
                 parent_labels: list[Label] = []
                 for pname, param in signature.parameters.items():
@@ -163,16 +176,24 @@ class Guard:
                     if param.kind is inspect.Parameter.VAR_POSITIONAL:
                         items = [_classify(item) for item in raw]
                         bound.arguments[pname] = tuple(value for _, value, _ in items)
+                        arg_idents[pname] = [
+                            _arg_identity(value, pid) for _, value, pid in items
+                        ]
                     elif param.kind is inspect.Parameter.VAR_KEYWORD:
                         items = [_classify(item) for item in raw.values()]
                         bound.arguments[pname] = {
                             key: value
                             for key, (_, value, _) in zip(raw, items, strict=True)
                         }
+                        arg_idents[pname] = {
+                            key: _arg_identity(value, pid)
+                            for key, (_, value, pid) in zip(raw, items, strict=True)
+                        }
                     else:
                         label, value, parent = _classify(raw)
                         items = [(label, value, parent)]
                         bound.arguments[pname] = value
+                        arg_idents[pname] = _arg_identity(value, parent)
                     arg_labels[pname] = join_all(label for label, _, _ in items)
                     parent_labels.extend(label for label, _, _ in items)
                     parent_ids.extend(pid for _, _, pid in items if pid is not None)
@@ -181,14 +202,22 @@ class Guard:
                 self._monitor.mediate(action, arg_labels)
 
                 # The call node is the content-addressed identity of the REQUEST
-                # (tool + bound arguments) -- the cassette key a replay looks up.
+                # (tool + argument identities) -- the cassette key a replay looks up.
                 call_node = Node(
                     NodeKind.TOOL_CALL,
                     tuple(parent_ids),
-                    {"tool": action, "args": _payload(dict(bound.arguments))},
+                    {"tool": action, "args": arg_idents},
                 )
-                result = func(*bound.args, **bound.kwargs)
-                result_node = Node(NodeKind.TOOL_RESULT, (call_node.id,), _payload(result))
+                # On replay, the recorded result is served and the tool never runs
+                # (INV-8); a request not in the cassette fails closed (INV-5).
+                if self._replayer is not None:
+                    result_node = self._replayer.resolve(call_node)
+                    result: Any = result_node.payload
+                else:
+                    result = func(*bound.args, **bound.kwargs)
+                    result_node = Node(
+                        NodeKind.TOOL_RESULT, (call_node.id,), _payload(result)
+                    )
                 label = self._strategy.node_label(result_node, parent_labels, source_label)
                 if self._recorder is not None:
                     self._recorder.record_boundary(call_node, result_node)
