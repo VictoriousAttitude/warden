@@ -10,6 +10,7 @@ from warden.core.canonical import (
     CanonicalValue,
     canonical_cbor,
 )
+from warden.core.decode import CborDecodeError, decode_canonical, loads
 from warden.core.graph import Graph, MissingParentError, UnknownNodeError
 from warden.core.hashing import (
     Blake2b256,
@@ -18,7 +19,14 @@ from warden.core.hashing import (
     default_hash,
     multihash,
 )
-from warden.core.nodes import Node, NodeId, NodeKind, compute_node_id, encode_node
+from warden.core.nodes import (
+    Node,
+    NodeId,
+    NodeKind,
+    compute_node_id,
+    decode_node,
+    encode_node,
+)
 from warden.core.run import Divergence, Run, RunManifest, diff, fork
 from warden.core.store import IntegrityError, ObjectStore
 
@@ -27,6 +35,7 @@ __all__ = [
     "Blake3",
     "CanonicalEncodingError",
     "CanonicalValue",
+    "CborDecodeError",
     "Divergence",
     "Graph",
     "HashAlgo",
@@ -41,9 +50,12 @@ __all__ = [
     "UnknownNodeError",
     "canonical_cbor",
     "compute_node_id",
+    "decode_canonical",
+    "decode_node",
     "default_hash",
     "diff",
     "encode_node",
     "fork",
+    "loads",
     "multihash",
 ]

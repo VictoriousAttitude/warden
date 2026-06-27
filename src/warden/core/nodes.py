@@ -17,13 +17,15 @@ be substituted for another by content collision.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 
 from warden.core.canonical import CanonicalValue, canonical_cbor
+from warden.core.decode import decode_canonical
 from warden.core.hashing import HashAlgo, default_hash, multihash
 
-__all__ = ["Node", "NodeId", "NodeKind", "compute_node_id", "encode_node"]
+__all__ = ["Node", "NodeId", "NodeKind", "compute_node_id", "decode_node", "encode_node"]
 
 
 class NodeKind(IntEnum):
@@ -74,6 +76,34 @@ def _envelope(
 def encode_node(node: Node) -> bytes:
     """Return the canonical byte preimage of a node (the bytes its id hashes)."""
     return canonical_cbor(_envelope(node.kind, node.parents, node.payload))
+
+
+def decode_node(data: bytes) -> Node:
+    """Rehydrate a node from its canonical byte preimage (inverse of ``encode_node``).
+
+    ``data`` must be the canonical envelope ``encode_node`` produced; the input is
+    validated as canonical (``decode_canonical``) and structurally, so corrupt or
+    forged bytes raise rather than yielding a malformed node. The returned node
+    recomputes its own id, so callers can confirm it matches the key it was read
+    under (see ``ObjectStore.get_node``).
+    """
+    envelope = decode_canonical(data)
+    if not isinstance(envelope, Mapping):
+        raise ValueError("node preimage is not a map")
+    if "payload" not in envelope:
+        raise ValueError("node preimage is missing 'payload'")
+    kind_raw = envelope.get("kind")
+    parents_raw = envelope.get("parents")
+    if isinstance(kind_raw, bool) or not isinstance(kind_raw, int):
+        raise ValueError("node 'kind' must be an integer")
+    if isinstance(parents_raw, (str, bytes)) or not isinstance(parents_raw, Sequence):
+        raise ValueError("node 'parents' must be a list")
+    parents: list[NodeId] = []
+    for parent in parents_raw:
+        if not isinstance(parent, bytes):
+            raise ValueError("each parent must be a multihash byte string")
+        parents.append(NodeId(parent))
+    return Node(NodeKind(kind_raw), tuple(parents), envelope["payload"])
 
 
 def compute_node_id(

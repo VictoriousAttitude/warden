@@ -20,7 +20,7 @@ import zlib
 from pathlib import Path
 
 from warden.core.hashing import HashAlgo, default_hash, multihash
-from warden.core.nodes import Node, NodeId, encode_node
+from warden.core.nodes import Node, NodeId, decode_node, encode_node
 
 __all__ = ["IntegrityError", "ObjectStore"]
 
@@ -71,3 +71,10 @@ class ObjectStore:
         if NodeId(multihash(self._algo, content)) != key:
             raise IntegrityError(f"content at {path} does not match {key!r}")
         return content
+
+    def get_node(self, key: NodeId) -> Node:
+        """Read and rehydrate a node, verifying its recomputed id matches ``key``."""
+        node = decode_node(self.get(key))
+        if node.id != key:
+            raise IntegrityError(f"rehydrated node id does not match {key!r}")
+        return node
