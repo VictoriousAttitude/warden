@@ -34,6 +34,14 @@ dev = [
   "ruff>=0.5",
   "cbor2>=5",          # used ONLY as an independent decode oracle in tests
 ]
+# The eval extra wires Warden into the real AgentDojo benchmark. It is heavyweight
+# (pulls model SDKs and the benchmark suites) and strictly optional: the core
+# library and the Guard never import it. A live model is used ONLY to record
+# transcripts; CI replays them hermetically through the Harness. `pip install
+# warden[eval]`.
+eval = [
+  "agentdojo>=0.1.35",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/warden"]
@@ -50,6 +58,12 @@ disallow_any_decorated = true
 
 [[tool.mypy.overrides]]
 module = "blake3"
+ignore_missing_imports = true
+
+# The AgentDojo benchmark and the model SDKs behind the eval extra are not part of
+# the typed core; the eval adapter is checked, but their imports are not resolved.
+[[tool.mypy.overrides]]
+module = "agentdojo.*"
 ignore_missing_imports = true
 
 [tool.ruff]
