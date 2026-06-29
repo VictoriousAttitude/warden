@@ -21,7 +21,7 @@ from warden.harness import (
     Replayer,
     ReplayError,
 )
-from warden.intercept import Guard, Handle
+from warden.intercept import Guard, Handle, Session
 from warden.labels import Confidentiality, Label, Taint
 from warden.monitor import WardenPolicyViolation
 from warden.policy import ToolClass, compile_policy
@@ -36,6 +36,7 @@ __all__ = [
     "Recording",
     "ReplayError",
     "Replayer",
+    "Session",
     "Taint",
     "ToolClass",
     "WardenPolicyViolation",

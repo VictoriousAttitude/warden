@@ -19,11 +19,20 @@ labels and the tool's source label, so taint cannot be laundered out of a deriva
 function runs (complete mediation, arch section 8); a denial raises
 ``WardenPolicyViolation`` and the side effect never happens.
 
+Because a result is a labeled Handle whose bytes are read back only via ``Guard.value``,
+code that passes Handles directly is already per-handle precise: an independent trusted
+handle is unaffected by an untrusted one, so there is no conversation-wide creep. The
+one place that discipline breaks is the round-trip through a free-typing model -- read a
+handle's bytes, hand them to an LLM, and the LLM re-types them as a fresh literal,
+laundering the label away (finding F5). ``Guard.session`` closes that round-trip: a
+``Session`` masks each handle to the model as an opaque token (never its bytes) and
+resolves what the model emits back to per-handle labels (arch section 6.2, M3).
+
 Residual (documented, not hidden): a Handle nested inside a composite argument (a
 list, dict, or dataclass passed as one parameter) is not unwrapped, so its label is
 not traced -- pass handles as direct arguments. Top-level ``*args``/``**kwargs`` ARE
 folded in. Soundness of WHOLE_CONTEXT holds over directly-passed handles; structural
-laundering through opaque containers is the M3 dual-plane / static-analysis frontier.
+laundering through opaque containers is the static-analysis frontier.
 """
 
 from __future__ import annotations
@@ -41,7 +50,10 @@ from warden.monitor import Monitor
 from warden.policy import Policy, ToolClass, compile_policy
 from warden.propagate import WHOLE_CONTEXT, PropagationStrategy
 
-__all__ = ["Guard", "Handle"]
+__all__ = ["Guard", "Handle", "Session"]
+
+# Prefix of the opaque tokens a Session shows a model in place of a handle's bytes.
+_HANDLE_PREFIX = "<warden-handle:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +140,10 @@ class Guard:
     def value(self, handle: Handle) -> Any:
         """Reveal the underlying value of a handle (trusted egress read)."""
         return handle._value
+
+    def session(self) -> Session:
+        """Open a masking boundary for ferrying handles to and from a free-typing model."""
+        return Session(self)
 
     @overload
     def tool(self, fn: Callable[..., Any], /) -> Callable[..., Handle]: ...
@@ -234,3 +250,51 @@ class Guard:
             return wrapper
 
         return decorate if fn is None else decorate(fn)
+
+
+class Session:
+    """A masking boundary between the Guard's handles and a free-typing model.
+
+    The in-process Guard is already per-handle sound for code that passes ``Handle``
+    objects directly: a derivation of an untrusted handle stays untrusted while an
+    independent trusted handle is unaffected, so there is no conversation-wide creep.
+    The one place that breaks is the round-trip through a free-typing model -- read a
+    handle's bytes with ``Guard.value``, hand them to an LLM, and the LLM can re-type
+    them as a fresh literal argument, laundering the label away (finding F5).
+
+    A session closes that round-trip. ``mask`` renders a handle to the model as an
+    opaque token -- never its bytes -- and remembers the binding. ``unmask`` resolves
+    what the model emits: a known token back to the exact handle it named (label and
+    all), and anything else to a fresh bottom (trusted/public) handle, because a model
+    that only ever saw tokens demonstrably never received labeled bytes to launder
+    into a literal. Mediation downstream then sees per-handle labels, soundly.
+
+    The residual is "complete masking": the guarantee holds only if every labeled
+    value shown to the model goes through ``mask`` (and none is leaked out of band via
+    ``Guard.value``) -- the data-plane analogue of complete mediation (finding F4).
+    Tokens are minted in call order, so a session is deterministic and replay-stable; a
+    token name is server-minted, so a forged or stale name resolves to a harmless
+    trusted literal of that text, never to a labeled value.
+    """
+
+    __slots__ = ("_bindings", "_guard")
+
+    def __init__(self, guard: Guard) -> None:
+        self._guard = guard
+        self._bindings: dict[str, Handle] = {}
+
+    def mask(self, handle: Handle) -> str:
+        """Render ``handle`` to the model as an opaque token; remember the binding."""
+        token = f"{_HANDLE_PREFIX}{len(self._bindings)}>"
+        self._bindings[token] = handle
+        return token
+
+    def unmask(self, value: Any) -> Handle:
+        """Resolve a model-emitted argument to a handle.
+
+        A known token returns the exact handle it named; anything else is a literal
+        the model typed itself, minted as a fresh bottom (trusted/public) handle.
+        """
+        if isinstance(value, str) and value in self._bindings:
+            return self._bindings[value]
+        return self._guard.source(value)
