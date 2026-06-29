@@ -9,12 +9,12 @@ to spot "malicious" prompts are bypassable. Warden takes the principled route fr
 classical security engineering: label every value with integrity and
 confidentiality, propagate those labels along the agent's data-flow graph, and
 enforce a capability policy at a single reference monitor that mediates every
-consequential action — fail-closed, with an explainable provenance path for every
-denial.
+consequential action(fail-closed, with an explainable provenance path for every denial)
 
 Warden is framework-agnostic and local-first. It is not a model, not a scanner,
-and does not claim to "solve" prompt injection; it bounds the blast radius and
-makes exploitation provably hard given correct policies.
+and does not claim to "solve" prompt injection.
+
+It bounds the blast radius and makes exploitation provably hard given correct policies.
 
 ## Quickstart
 
