@@ -141,6 +141,25 @@ class Guard:
         """Reveal the underlying value of a handle (trusted egress read)."""
         return handle._value
 
+    def declassify(self, handle: Handle, *, to: Label) -> Handle:
+        """Lower a handle's label by explicit authority: the sanctioned break of INV-3.
+
+        Propagation is monotone -- a derived value is at least as restrictive as its
+        inputs, so taint never washes out on its own (arch section 5.4). Declassification
+        is the audited exception: an authority asserts that one specific value may carry
+        a lower label, e.g. a reviewed summary of secret data cleared for release. ``to``
+        must be no more restrictive than the handle's current label on every axis, so a
+        declassification can only move DOWN the lattice; it can never fabricate trust or
+        confidentiality the value did not have. The downgrade is committed as a
+        DECLASSIFICATION node so it is visible in the provenance graph.
+        """
+        if not to.leq(handle.label):
+            raise ValueError("declassification must not raise the label on any axis")
+        node = Node(NodeKind.DECLASSIFICATION, (handle.id,), _payload(handle._value))
+        if self._recorder is not None:
+            self._recorder.record_source(node)
+        return Handle(node.id, to, handle._value)
+
     def session(self) -> Session:
         """Open a masking boundary for ferrying handles to and from a free-typing model."""
         return Session(self)

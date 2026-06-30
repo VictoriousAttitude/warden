@@ -145,3 +145,33 @@ def test_unregistered_action_name_overrides_function_name() -> None:
         return "ok"
 
     assert guard.value(post_to_blog(data=guard.source("hello"))) == "ok"
+
+
+def test_declassification_lets_a_reviewed_value_through() -> None:
+    guard = _guard()
+    tools = _wire(guard)
+    web = tools["fetch_url"](guard.source("http://evil.test"))  # type: ignore[operator]
+    assert web.label.integrity is Taint.UNTRUSTED
+    # An authority reviews the value and clears it for release; only then does the
+    # sink that refuses untrusted bodies accept it.
+    cleared = guard.declassify(web, to=Label.bottom())
+    assert guard.value(cleared) == guard.value(web)
+    receipt = tools["send_email"](body=cleared, recipient=guard.source("alice@corp"))  # type: ignore[operator]
+    assert guard.value(receipt) == "sent to alice@corp"
+
+
+def test_declassification_can_lower_one_axis_and_hold_another() -> None:
+    guard = _guard()
+    tools = _wire(guard)
+    secret = tools["read_secret"](guard.source("api_key"))  # type: ignore[operator]
+    assert secret.label.confidentiality is Confidentiality.SECRET
+    cleared = guard.declassify(secret, to=Label(confidentiality=Confidentiality.INTERNAL))
+    assert cleared.label.confidentiality is Confidentiality.INTERNAL
+    assert guard.value(tools["post"](data=cleared)) == "posted"  # type: ignore[operator]
+
+
+def test_declassification_cannot_raise_a_label() -> None:
+    guard = _guard()
+    handle = guard.source("plain")  # trusted, public
+    with pytest.raises(ValueError, match="must not raise"):
+        guard.declassify(handle, to=Label(Taint.UNTRUSTED))
