@@ -43,4 +43,4 @@ __all__ = [
     "compile_policy",
 ]
 
-__version__ = "0.0.0"
+__version__ = "0.1.0"

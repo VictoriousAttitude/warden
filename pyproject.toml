@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "warden"
-version = "0.0.0"
+version = "0.1.0"
 description = "A runtime trust layer for LLM agents: information-flow control and capability enforcement at the tool boundary."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,14 +12,21 @@ license = "Apache-2.0"
 authors = [{ name = "Dima Khaver" }]
 keywords = ["llm", "agents", "security", "information-flow-control", "prompt-injection"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3.12",
   "Topic :: Security",
+  "Typing :: Typed",
 ]
 # Core identity layer is dependency-free: the default hash is stdlib BLAKE2b-256,
 # which keeps node ids reproducible on any interpreter without a native build.
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/VictoriousAttitude/warden"
+Repository = "https://github.com/VictoriousAttitude/warden"
+Issues = "https://github.com/VictoriousAttitude/warden/issues"
 
 [project.optional-dependencies]
 # BLAKE3 is the intended production hash (faster, parallel); it is opt-in behind
