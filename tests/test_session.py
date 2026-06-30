@@ -13,6 +13,8 @@ never saw the bytes.
 from __future__ import annotations
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from warden import (
     Confidentiality,
@@ -21,6 +23,22 @@ from warden import (
     Taint,
     ToolClass,
     WardenPolicyViolation,
+)
+
+_SOURCES = ["inbox", "db", "web"]
+
+label_strategy = st.builds(
+    Label,
+    integrity=st.sampled_from(Taint),
+    confidentiality=st.sampled_from(Confidentiality),
+    provenance=st.frozensets(st.sampled_from(_SOURCES), max_size=3),
+)
+
+# Strings the model might emit: free text plus forged/stale token-shaped names, so the
+# laundering property is tested against an adversary that guesses the token format.
+literal_strategy = st.one_of(
+    st.text(max_size=12),
+    st.builds(lambda n: f"<warden-handle:{n}>", st.integers(min_value=0, max_value=20)),
 )
 
 # Gate the sink on the recipient's integrity, exactly as the eval's information-flow
@@ -142,3 +160,59 @@ def test_exfiltration_recipient_arrives_untrusted_and_is_denied() -> None:
             recipient=session.unmask(t_addr),
             body=session.unmask(t_contacts),
         )
+
+
+# --- masking soundness lemma (property-based) -------------------------------
+
+
+@given(st.lists(label_strategy, min_size=1, max_size=6))
+def test_every_token_round_trips_to_its_handle_at_the_exact_label(
+    labels: list[Label],
+) -> None:
+    # A token returns the EXACT handle it named -- same value, same label. Masking
+    # neither raises nor lowers a label, so per-handle precision is preserved.
+    guard = Guard("allow send_email if body.integrity == trusted")
+    session = guard.session()
+    masked = []
+    for i, label in enumerate(labels):
+        handle = guard.source(
+            f"value-{i}",
+            integrity=label.integrity,
+            confidentiality=label.confidentiality,
+            provenance=label.provenance,
+        )
+        masked.append((session.mask(handle), handle, label))
+
+    for token, handle, label in masked:
+        got = session.unmask(token)
+        assert got is handle
+        assert got.label == label
+        assert guard.value(got) == guard.value(handle)
+
+
+@given(st.lists(label_strategy, min_size=1, max_size=4), literal_strategy)
+def test_a_non_token_literal_is_bottom_carrying_only_its_own_bytes(
+    labels: list[Label], emitted: str
+) -> None:
+    # The lemma (literal => bottom): with every labeled value masked, anything the
+    # model types that is not a live token resolves to a trusted/public handle that
+    # carries only the typed bytes -- never a masked value's bytes at a lower label.
+    guard = Guard("allow send_email if body.integrity == trusted")
+    session = guard.session()
+    tokens = {
+        session.mask(
+            guard.source(
+                f"value-{i}",
+                integrity=label.integrity,
+                confidentiality=label.confidentiality,
+                provenance=label.provenance,
+            )
+        )
+        for i, label in enumerate(labels)
+    }
+
+    if emitted in tokens:  # a live token is the round-trip case, covered above
+        return
+    got = session.unmask(emitted)
+    assert got.label == Label.bottom()
+    assert guard.value(got) == emitted
