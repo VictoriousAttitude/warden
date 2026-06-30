@@ -49,6 +49,10 @@ dev = [
 eval = [
   "agentdojo>=0.1.35",
 ]
+# The langgraph extra wires Warden into the dominant graph runtime via the drop-in
+# `WardenToolNode`. The core library and the Guard never import it; it is pulled
+# only when `warden.adapters.langgraph` is imported. `pip install warden[langgraph]`.
+langgraph = ["langgraph>=0.2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/warden"]
@@ -71,6 +75,16 @@ ignore_missing_imports = true
 # the typed core; the eval adapter is checked, but their imports are not resolved.
 [[tool.mypy.overrides]]
 module = "agentdojo.*"
+ignore_missing_imports = true
+
+# LangGraph and langchain_core back the optional langgraph adapter; the adapter is
+# checked, but their imports are not resolved (same pattern as the eval extra).
+[[tool.mypy.overrides]]
+module = "langgraph.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "langchain_core.*"
 ignore_missing_imports = true
 
 [tool.ruff]
