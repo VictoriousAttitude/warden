@@ -36,7 +36,7 @@ from warden import (
     Taint,
     ToolClass,
 )
-from warden.adapters.langgraph import WardenToolNode
+from warden.adapters.langgraph import WardenToolNode, _is_approval
 
 # Gate the sink on the recipient's integrity, exactly as the in-process Session
 # test does, so the graph result is comparable to the transport-boundary number.
@@ -462,3 +462,65 @@ def test_approval_does_not_double_execute_an_already_run_call() -> None:
     assert len(managers) == 1
     # The approved (declassified) send also went out.
     assert len(outbox) == 2
+
+
+@pytest.mark.parametrize(
+    ("decision", "approved"),
+    [
+        (True, True),
+        ("approve", True),
+        ({"approve": True}, True),
+        ({"decision": "approve"}, True),
+        (False, False),
+        ("reject", False),
+        (None, False),
+        ({"decision": "reject"}, False),
+        ({"approve": False}, False),
+        ({}, False),
+    ],
+)
+def test_is_approval_recognizes_only_explicit_approvals(
+    decision: Any, approved: bool
+) -> None:
+    # The accepted approval forms (documented on ``on_denial``): a bare ``True``, the
+    # string "approve", or a mapping with ``approve: True`` / ``decision: "approve"``.
+    # Everything else -- a bare rejection, a mapping that does not approve -- is denied.
+    assert _is_approval(decision) is approved
+
+
+def test_two_sequential_interrupts_in_one_node_stay_counter_aligned() -> None:
+    # The re-execution invariant the whole memo design exists for: TWO denied sends in
+    # one turn escalate one after another. Resuming the first pauses again on the
+    # second, so on the third pass the first call (already approved) must re-issue its
+    # interrupt to hold LangGraph's positional counter -- WITHOUT re-running its body.
+    guard = Guard(_POLICY)
+    outbox: list[tuple[str, str]] = []
+    node = WardenToolNode(guard, _wire(guard, outbox), on_denial="interrupt")
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _multi_call(
+            [
+                ("send_email", {"recipient": f"{_HANDLE_PREFIX}1>", "body": "first"}, "b1"),
+                ("send_email", {"recipient": f"{_HANDLE_PREFIX}1>", "body": "second"}, "b2"),
+            ]
+        ),
+        AIMessage(content="done"),
+    ]
+    app = _build_graph(node, script, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "hitl"}}
+
+    first = app.invoke(
+        {"messages": [HumanMessage(content="Forward my email twice.")]}, config=config
+    )
+    assert "__interrupt__" in first  # paused on the first denied send
+
+    second = app.invoke(Command(resume=True), config=config)
+    assert "__interrupt__" in second  # first approved -> paused again on the second
+
+    result = app.invoke(Command(resume=True), config=config)
+    # Both approved sends went out exactly once each -- no double execution of the
+    # first call when the node re-ran to deliver the second resume.
+    assert sorted(body for _, body in outbox) == ["first", "second"]
+    assert "__interrupt__" not in result
+    assert isinstance(result["messages"][-1], AIMessage)
