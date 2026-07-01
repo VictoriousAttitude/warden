@@ -24,8 +24,10 @@ import pytest
 pytest.importorskip("langgraph")
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Command
 
 from warden import (
     Confidentiality,
@@ -94,11 +96,14 @@ class _State(TypedDict):
     messages: Annotated[list[Any], add_messages]
 
 
-def _build_graph(node: WardenToolNode, script: list[AIMessage]) -> Any:
+def _build_graph(
+    node: WardenToolNode, script: list[AIMessage], *, checkpointer: Any = None
+) -> Any:
     """Compile a real StateGraph: a scripted ``agent`` node plus the Warden tool node.
 
     The agent emits ``script[k]`` on its k-th turn (k = number of AIMessages already
-    in state), so the transcript is fixed and the run is fully deterministic.
+    in state), so the transcript is fixed and the run is fully deterministic. A
+    ``checkpointer`` is required for the ``on_denial="interrupt"`` escalation path.
     """
 
     def agent(state: _State) -> dict[str, list[Any]]:
@@ -115,7 +120,7 @@ def _build_graph(node: WardenToolNode, script: list[AIMessage]) -> Any:
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", route, {"tools": "tools", END: END})
     graph.add_edge("tools", "agent")
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def _call(name: str, args: dict[str, Any], cid: str) -> AIMessage:
@@ -321,3 +326,139 @@ def test_a_separate_thread_gets_a_fresh_session() -> None:
         {"configurable": {"thread_id": "thread-b"}},
     )
     assert not out["messages"][0].content.startswith(_HANDLE_PREFIX)
+
+
+# --- human-in-the-loop declassification via interrupt() ------------------------
+
+
+def _multi_call(calls: list[tuple[str, dict[str, Any], str]]) -> AIMessage:
+    tool_calls = [{"name": n, "args": a, "id": c} for n, a, c in calls]
+    return AIMessage(content="", tool_calls=tool_calls)
+
+
+def test_invalid_on_denial_is_rejected() -> None:
+    guard = Guard(_POLICY)
+    with pytest.raises(ValueError, match="on_denial"):
+        WardenToolNode(guard, _wire(guard, []), on_denial="pause")  # type: ignore[arg-type]
+
+
+def test_a_denied_call_interrupts_for_human_review() -> None:
+    # In interrupt mode a denied send pauses the graph instead of erroring: the run
+    # halts on an interrupt carrying the provenance path, and the sink never fired.
+    guard = Guard(_POLICY)
+    outbox: list[tuple[str, str]] = []
+    node = WardenToolNode(guard, _wire(guard, outbox), on_denial="interrupt")
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _call(
+            "send_email",
+            {"recipient": f"{_HANDLE_PREFIX}1>", "body": f"{_HANDLE_PREFIX}0>"},
+            "c2",
+        ),
+        AIMessage(content="done"),
+    ]
+    app = _build_graph(node, script, checkpointer=InMemorySaver())
+    result = app.invoke(
+        {"messages": [HumanMessage(content="Forward my latest email.")]},
+        config={"configurable": {"thread_id": "hitl"}},
+    )
+
+    interrupts = result["__interrupt__"]
+    assert len(interrupts) == 1
+    payload = interrupts[0].value
+    assert payload["action"] == "send_email"
+    # Provenance-only: the raw untrusted bytes never ride the review prompt.
+    assert _EMAIL not in str(payload)
+    assert "attacker@evil.example" not in str(payload)
+    assert payload["provenance"]  # the explainable path is present
+    assert outbox == []  # the sink is still fail-closed while paused
+
+
+def test_approval_declassifies_and_re_runs_through_the_monitor() -> None:
+    # Resuming with an approval lowers the call's arguments to bottom (the sanctioned
+    # INV-3 downgrade) and re-runs THROUGH the monitor, so the send now goes out.
+    guard = Guard(_POLICY)
+    outbox: list[tuple[str, str]] = []
+    node = WardenToolNode(guard, _wire(guard, outbox), on_denial="interrupt")
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _call(
+            "send_email",
+            {"recipient": f"{_HANDLE_PREFIX}1>", "body": f"{_HANDLE_PREFIX}0>"},
+            "c2",
+        ),
+        AIMessage(content="done"),
+    ]
+    app = _build_graph(node, script, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "hitl"}}
+    app.invoke({"messages": [HumanMessage(content="Forward my email.")]}, config=config)
+
+    result = app.invoke(Command(resume=True), config=config)
+    # The approval let exactly one mail out; the graph ran to completion.
+    assert len(outbox) == 1
+    assert "__interrupt__" not in result
+    assert isinstance(result["messages"][-1], AIMessage)
+
+
+def test_rejection_leaves_the_call_denied() -> None:
+    guard = Guard(_POLICY)
+    outbox: list[tuple[str, str]] = []
+    node = WardenToolNode(guard, _wire(guard, outbox), on_denial="interrupt")
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _call(
+            "send_email",
+            {"recipient": f"{_HANDLE_PREFIX}1>", "body": f"{_HANDLE_PREFIX}0>"},
+            "c2",
+        ),
+        AIMessage(content="done"),
+    ]
+    app = _build_graph(node, script, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "hitl"}}
+    app.invoke({"messages": [HumanMessage(content="Forward my email.")]}, config=config)
+
+    result = app.invoke(Command(resume={"decision": "reject"}), config=config)
+    # Rejection: nothing sent, and the model sees an error ToolMessage.
+    assert outbox == []
+    errors = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.status == "error"
+    ]
+    assert len(errors) == 1
+    assert "rejected" in errors[0].content
+
+
+def test_approval_does_not_double_execute_an_already_run_call() -> None:
+    # Re-execution safety: a node with one ALLOWED and one DENIED send in the SAME
+    # turn re-runs from the top on resume, so the allowed body must fire exactly once
+    # (LangGraph re-executes the whole node; the memo prevents the double send).
+    guard = Guard(_POLICY)
+    outbox: list[tuple[str, str]] = []
+    node = WardenToolNode(guard, _wire(guard, outbox), on_denial="interrupt")
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _multi_call(
+            [
+                ("send_email", {"recipient": "manager@corp.example", "body": "hi"}, "a"),
+                (
+                    "send_email",
+                    {"recipient": f"{_HANDLE_PREFIX}1>", "body": f"{_HANDLE_PREFIX}0>"},
+                    "b",
+                ),
+            ]
+        ),
+        AIMessage(content="done"),
+    ]
+    app = _build_graph(node, script, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "hitl"}}
+    app.invoke({"messages": [HumanMessage(content="Forward my email.")]}, config=config)
+    app.invoke(Command(resume=True), config=config)
+
+    # The allowed manager send happened exactly once despite the node re-executing.
+    managers = [r for r, _ in outbox if r == "manager@corp.example"]
+    assert len(managers) == 1
+    # The approved (declassified) send also went out.
+    assert len(outbox) == 2
