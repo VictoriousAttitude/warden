@@ -44,3 +44,19 @@ jobs:
           cache: pip
       - run: pip install -e ".[dev,eval]"
       - run: pytest
+
+  langgraph:
+    # The LangGraph adapter integration. Installs the langgraph extra so the
+    # WardenToolNode end-to-end graph tests actually run instead of skipping
+    # (importorskip) -- hermetic: the "model" is a scripted graph node, so no
+    # provider is contacted and no API key is needed.
+    name: langgraph (WardenToolNode integration, hermetic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev,langgraph]"
+      - run: pytest
