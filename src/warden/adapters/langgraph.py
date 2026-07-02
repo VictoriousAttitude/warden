@@ -62,9 +62,10 @@ and hand Warden the decorated callables keyed by name.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
 from warden import Guard, Handle, Label, Session, WardenPolicyViolation
@@ -120,7 +121,7 @@ class WardenToolNode:
         self._sessions: dict[str, Session] = {}
         self._memo: dict[str, dict[str, _MemoEntry]] = {}
 
-    def _thread_id(self, config: Mapping[str, Any] | None) -> str:
+    def _thread_id(self, config: RunnableConfig | None) -> str:
         configurable = (config or {}).get("configurable") or {}
         thread_id: str = configurable.get("thread_id", _DEFAULT_THREAD)
         return thread_id
@@ -218,7 +219,13 @@ class WardenToolNode:
     def __call__(
         self,
         state: Mapping[str, Any],
-        config: Mapping[str, Any] | None = None,
+        # This annotation is LOAD-BEARING and matched TEXTUALLY: under postponed
+        # evaluation LangGraph injects the runnable config only for the literal
+        # spellings "RunnableConfig" / "Optional[RunnableConfig]". Any other
+        # spelling (including "RunnableConfig | None") silently receives None,
+        # which would collapse every thread onto the default session --
+        # cross-thread token leakage on a shared node.
+        config: Optional[RunnableConfig] = None,  # noqa: UP045
     ) -> dict[str, list[Any]]:
         last = state["messages"][-1]
         thread_id = self._thread_id(config)

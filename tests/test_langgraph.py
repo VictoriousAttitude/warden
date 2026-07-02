@@ -306,6 +306,41 @@ def test_a_token_arg_round_trips_to_its_handle_across_two_calls_on_a_thread() ->
     assert content.startswith(_HANDLE_PREFIX)
 
 
+def test_threads_do_not_share_a_session_through_a_real_graph() -> None:
+    # Regression: LangGraph injects the runnable config only when the node's
+    # ``config`` parameter is annotated RunnableConfig. Under a looser annotation
+    # every graph run received config=None, so ALL threads shared the default
+    # session -- a token minted on thread A was a LIVE binding on thread B, i.e.
+    # cross-thread leakage of a labeled value on a shared node. The direct-call
+    # unit test above cannot catch this; only a real compiled graph does.
+    guard = Guard(_POLICY)
+    node = WardenToolNode(guard, _wire(guard, []))
+    checkpointer = InMemorySaver()
+
+    reader = _build_graph(
+        node, [_call("read_inbox", {}, "c0"), AIMessage(content="done")],
+        checkpointer=checkpointer,
+    )
+    reader.invoke(
+        {"messages": [HumanMessage(content="Read my email.")]},
+        config={"configurable": {"thread_id": "thread-a"}},
+    )
+
+    prober = _build_graph(
+        node,
+        [_call("summarize", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"), AIMessage(content="done")],
+        checkpointer=checkpointer,
+    )
+    result = prober.invoke(
+        {"messages": [HumanMessage(content="Summarize.")]},
+        config={"configurable": {"thread_id": "thread-b"}},
+    )
+    # On thread B the token must NOT resolve: summarize ran on a bottom literal,
+    # so its result is shown raw, not masked.
+    contents = _tool_contents(result["messages"])
+    assert not contents[-1].startswith(_HANDLE_PREFIX)
+
+
 def test_a_separate_thread_gets_a_fresh_session() -> None:
     # Tokens are per-thread: a token minted on one thread is NOT a live binding on
     # another, so it resolves to a harmless bottom literal there (never cross-thread
