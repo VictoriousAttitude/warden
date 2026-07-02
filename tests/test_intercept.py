@@ -15,10 +15,12 @@ from warden import (
     Confidentiality,
     Guard,
     Label,
+    Recorder,
     Taint,
     ToolClass,
     WardenPolicyViolation,
 )
+from warden.core import NodeKind
 
 _POLICY = """
 deny send_email if body.integrity != trusted
@@ -147,6 +149,61 @@ def test_unregistered_action_name_overrides_function_name() -> None:
     assert guard.value(post_to_blog(data=guard.source("hello"))) == "ok"
 
 
+def test_raw_literal_arguments_carry_bottom() -> None:
+    guard = _guard()
+
+    @guard.tool(cls=ToolClass.READ_ONLY)
+    def summarize(text: str) -> str:
+        return f"summary: {text}"
+
+    # A raw (non-Handle) argument is born bottom, so the derivation stays bottom.
+    digest = summarize("plain text")
+    assert digest.label == Label.bottom()
+    assert guard.value(digest) == "summary: plain text"
+
+
+def test_raw_argument_does_not_dilute_a_labeled_one() -> None:
+    guard = _guard()
+
+    @guard.tool(cls=ToolClass.READ_ONLY)
+    def concat(a: str, b: str) -> str:
+        return a + b
+
+    tainted = guard.source("injected", integrity=Taint.UNTRUSTED)
+    mixed = concat(tainted, " and plain")
+    # Join, not average: one untrusted input taints the whole derivation.
+    assert mixed.label.integrity is Taint.UNTRUSTED
+    assert guard.value(mixed) == "injected and plain"
+
+
+def test_var_positional_handles_are_unwrapped_and_joined() -> None:
+    guard = _guard()
+
+    @guard.tool(cls=ToolClass.READ_ONLY)
+    def join_lines(*parts: str) -> str:
+        return "\n".join(parts)
+
+    tainted = guard.source("injected", integrity=Taint.UNTRUSTED)
+    result = join_lines(guard.source("header"), tainted, "raw footer")
+    # The body sees raw values; the label joins every element of *parts.
+    assert guard.value(result) == "header\ninjected\nraw footer"
+    assert result.label.integrity is Taint.UNTRUSTED
+
+
+def test_var_keyword_handles_are_unwrapped_and_joined() -> None:
+    guard = _guard()
+
+    @guard.tool(cls=ToolClass.READ_ONLY)
+    def render(**fields: str) -> str:
+        return ", ".join(f"{key}={value}" for key, value in fields.items())
+
+    secret = guard.source("s3cr3t", confidentiality=Confidentiality.SECRET)
+    result = render(user="alice", token=secret)
+    # The body sees raw values; the label joins every value of **fields.
+    assert guard.value(result) == "user=alice, token=s3cr3t"
+    assert result.label.confidentiality is Confidentiality.SECRET
+
+
 def test_declassification_lets_a_reviewed_value_through() -> None:
     guard = _guard()
     tools = _wire(guard)
@@ -175,3 +232,15 @@ def test_declassification_cannot_raise_a_label() -> None:
     handle = guard.source("plain")  # trusted, public
     with pytest.raises(ValueError, match="must not raise"):
         guard.declassify(handle, to=Label(Taint.UNTRUSTED))
+
+
+def test_declassification_is_committed_to_the_provenance_graph() -> None:
+    recorder = Recorder()
+    guard = Guard(_POLICY, recorder=recorder)
+    tainted = guard.source("reviewed text", integrity=Taint.UNTRUSTED)
+    cleared = guard.declassify(tainted, to=Label.bottom())
+    # The audited exception is visible in the graph: a DECLASSIFICATION node
+    # whose parent is the handle it downgraded.
+    node = recorder.recording().graph.get(cleared.id)
+    assert node.kind is NodeKind.DECLASSIFICATION
+    assert node.parents == (tainted.id,)
