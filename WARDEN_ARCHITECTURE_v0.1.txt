@@ -368,7 +368,9 @@ fixed-width BITSETS (∪ = OR, O(1)). Keeps §6.7's O(parents) budget real.
 ---------------------------------------------
 The policy evaluator runs on attacker-INFLUENCED labels, so the language itself
 must be incorruptible: TOTAL (always terminates), SIDE-EFFECT-FREE, no loops, no
-calls, no I/O. A small external grammar (e.g. Lark) → AST → compiled predicate.
+calls, no I/O. A hand-written tokenizer + recursive-descent parser → AST →
+compiled predicate: the security-critical parse is OWNED, not delegated to a
+parser library (the F3 ethos), and the Guard stays zero-dependency.
 This satisfies v0.2's "versioned, compiled, unit-testable" and adds: provably
 terminating, decidable evaluation.
 
@@ -494,12 +496,14 @@ pure reads.
   * Python ≥ 3.12; src layout; Apache-2.0.
   * Immutable model: @dataclass(frozen=True, slots=True) for Node/Label ⇒
     hashable, no accidental mutation, fits INV-2.
-  * Encoding: canonical CBOR (cbor2 or equivalent) — but treat the library as
-    UNTRUSTED for canonicalization: §13 conformance tests assert it matches the
-    §4.3 spec exactly (this is the F3 "triple-check the assumed-solid part").
+  * Encoding: canonical CBOR via an OWN encoder and decoder — no library's
+    "canonical mode" is trusted for identity. cbor2 appears only in tests, as an
+    independent decode oracle; §13 conformance tests assert the §4.3 spec
+    exactly (this is the F3 "triple-check the assumed-solid part").
   * Hash: HashAlgo protocol; ids as multihash. Fixed default BLAKE2b-256
     (stdlib, zero-dep, reproducible); BLAKE3-256 opt-in via the `blake3` extra.
-  * Policy: Lark grammar → AST → compiled total predicate.
+  * Policy: hand-written recursive-descent parser → AST → compiled total
+    predicate (no parser dependency; the Guard stays zero-dependency).
   * Typing: mypy --strict / pyright strict, ZERO ignores in warden.core and
     warden.monitor (v0.2 §6.8).
   * Tests: pytest + Hypothesis (property tests). ruff for lint.
