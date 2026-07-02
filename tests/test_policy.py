@@ -32,6 +32,11 @@ def test_compiles_rule_with_condition() -> None:
     assert rule.condition is not None
 
 
+def test_compiles_unconditional_rule() -> None:
+    policy = compile_policy("allow read_doc")
+    assert policy.rules[0].condition is None
+
+
 def test_unknown_field_is_type_error() -> None:
     with pytest.raises(PolicyTypeError):
         compile_policy("deny x if y.readers == secret")
@@ -50,6 +55,63 @@ def test_unterminated_string_is_syntax_error() -> None:
 def test_missing_operator_is_syntax_error() -> None:
     with pytest.raises(PolicySyntaxError):
         compile_policy("deny x if y.integrity trusted")
+
+
+def test_unexpected_character_is_syntax_error() -> None:
+    # The grammar has no numeric literals: levels are named, never ranked by number.
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny x if y.confidentiality >= 2")
+
+
+def test_truncated_rule_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny")
+
+
+def test_missing_dot_after_identifier_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny x if body integrity == trusted")
+
+
+def test_unknown_rule_head_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("permit send_email")
+
+
+def test_non_name_action_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny (")
+
+
+def test_condition_opening_with_operator_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny x if == trusted")
+
+
+def test_membership_container_must_be_identifier() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny x if 'evil' in ==")
+
+
+def test_non_name_field_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny x if body.== trusted")
+
+
+def test_non_name_literal_is_syntax_error() -> None:
+    with pytest.raises(PolicySyntaxError):
+        compile_policy("deny x if body.integrity == (")
+
+
+def test_bad_confidentiality_literal_is_type_error() -> None:
+    with pytest.raises(PolicyTypeError):
+        compile_policy("deny x if body.confidentiality == trusted")
+
+
+def test_provenance_compared_with_level_is_type_error() -> None:
+    # Provenance is a set; it is tested with `in`, never ranked against a level.
+    with pytest.raises(PolicyTypeError):
+        compile_policy("deny x if body.provenance == public")
 
 
 # --- decision semantics -----------------------------------------------------
@@ -145,6 +207,26 @@ def test_confidentiality_ordering() -> None:
         {"data": Label(confidentiality=Confidentiality.PUBLIC)},
         ToolClass.READ_ONLY,
     ).allowed
+    inclusive = compile_policy("allow post if data.confidentiality <= internal")
+    assert decide(
+        inclusive,
+        "post",
+        {"data": Label(confidentiality=Confidentiality.INTERNAL)},
+        ToolClass.CONSEQUENTIAL,
+    ).allowed
+    assert not decide(inclusive, "post", {"data": SECRET}, ToolClass.CONSEQUENTIAL).allowed
+
+
+def test_strict_ordering_operators() -> None:
+    policy = compile_policy(
+        "deny post if data.confidentiality > public\n"
+        "allow post if data.confidentiality < internal"
+    )
+    public = Label(confidentiality=Confidentiality.PUBLIC)
+    # PUBLIC: `> public` is strictly false, `< internal` holds => allowed.
+    assert decide(policy, "post", {"data": public}, ToolClass.CONSEQUENTIAL).allowed
+    # SECRET: `> public` fires the deny.
+    assert not decide(policy, "post", {"data": SECRET}, ToolClass.CONSEQUENTIAL).allowed
 
 
 def test_integrity_human_orientation() -> None:

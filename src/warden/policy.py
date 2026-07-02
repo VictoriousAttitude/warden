@@ -341,6 +341,9 @@ _CONF_RANK = {
 
 
 def _compare_ranks(actual: int, op: Op, expected: int) -> bool:
+    # Exhaustive over Op (mypy strict verifies: the function returns bool, never
+    # None). coverage.py cannot see exhaustiveness, hence the no-branch pragmas
+    # on the final arms here and in _eval.
     match op:
         case Op.EQ:
             return actual == expected
@@ -352,7 +355,7 @@ def _compare_ranks(actual: int, op: Op, expected: int) -> bool:
             return actual >= expected
         case Op.LT:
             return actual < expected
-        case Op.GT:
+        case Op.GT:  # pragma: no branch
             return actual > expected
 
 
@@ -366,7 +369,7 @@ def _eval(expr: Expr, values: Mapping[str, Label]) -> bool:
             return _eval(left, values) or _eval(right, values)
         case Membership(element, container):
             return element in _resolve(container.ident, values).provenance
-        case Compare(left, op, right):
+        case Compare(left, op, right):  # pragma: no branch
             label = _resolve(left.ident, values)
             if isinstance(right, Taint):
                 return _compare_ranks(
