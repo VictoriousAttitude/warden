@@ -27,6 +27,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
 
 from warden import (
@@ -36,7 +37,7 @@ from warden import (
     Taint,
     ToolClass,
 )
-from warden.adapters.langgraph import WardenToolNode, _is_approval
+from warden.adapters.langgraph import WardenToolNode, _encode_handle, _is_approval
 
 # Gate the sink on the recipient's integrity, exactly as the in-process Session
 # test does, so the graph result is comparable to the transport-boundary number.
@@ -97,13 +98,18 @@ class _State(TypedDict):
 
 
 def _build_graph(
-    node: WardenToolNode, script: list[AIMessage], *, checkpointer: Any = None
+    node: WardenToolNode,
+    script: list[AIMessage],
+    *,
+    checkpointer: Any = None,
+    store: Any = None,
 ) -> Any:
     """Compile a real StateGraph: a scripted ``agent`` node plus the Warden tool node.
 
     The agent emits ``script[k]`` on its k-th turn (k = number of AIMessages already
     in state), so the transcript is fixed and the run is fully deterministic. A
-    ``checkpointer`` is required for the ``on_denial="interrupt"`` escalation path.
+    ``checkpointer`` is required for the ``on_denial="interrupt"`` escalation path;
+    a ``store`` makes the node's session bindings durable across processes.
     """
 
     def agent(state: _State) -> dict[str, list[Any]]:
@@ -120,7 +126,7 @@ def _build_graph(
     graph.set_entry_point("agent")
     graph.add_conditional_edges("agent", route, {"tools": "tools", END: END})
     graph.add_edge("tools", "agent")
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=checkpointer, store=store)
 
 
 def _call(name: str, args: dict[str, Any], cid: str) -> AIMessage:
@@ -559,3 +565,148 @@ def test_two_sequential_interrupts_in_one_node_stay_counter_aligned() -> None:
     assert sorted(body for _, body in outbox) == ["first", "second"]
     assert "__interrupt__" not in result
     assert isinstance(result["messages"][-1], AIMessage)
+
+
+# --- surviving a process restart (store-backed session bindings) ---------------
+#
+# A "restart" is simulated the only honest way an in-process test can: a brand-new
+# Guard, tools, WardenToolNode, and compiled graph -- fresh memory, nothing shared
+# -- reattached to the SAME checkpointer and store, exactly what a redeployed
+# service does.
+
+
+def _restartable(
+    script: list[AIMessage], checkpointer: Any, store: Any
+) -> tuple[Any, list[tuple[str, str]]]:
+    """One 'process': fresh guard/tools/node/graph over the shared infrastructure."""
+    guard = Guard(_POLICY)
+    outbox: list[tuple[str, str]] = []
+    node = WardenToolNode(guard, _wire(guard, outbox))
+    return _build_graph(node, script, checkpointer=checkpointer, store=store), outbox
+
+
+def test_a_token_survives_a_restart_with_its_value_and_numbering() -> None:
+    # Turn 1 masks the inbox as token 0; the process then dies. The next process
+    # must resolve token 0 to the ORIGINAL email bytes (extract_address finds the
+    # address that only exists in those bytes) and keep minting from index 1, so
+    # the scripted token names line up.
+    script = [
+        _call("read_inbox", {}, "c0"),
+        AIMessage(content="paused before restart"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _call(
+            "send_email",
+            {"recipient": "manager@corp.example", "body": f"{_HANDLE_PREFIX}1>"},
+            "c2",
+        ),
+        AIMessage(content="done"),
+    ]
+    checkpointer, store = InMemorySaver(), InMemoryStore()
+    config = {"configurable": {"thread_id": "restart-fidelity"}}
+
+    first, _ = _restartable(script, checkpointer, store)
+    first.invoke({"messages": [HumanMessage(content="Read my email.")]}, config=config)
+
+    second, outbox = _restartable(script, checkpointer, store)
+    second.invoke({"messages": [HumanMessage(content="Continue.")]}, config=config)
+    # The address below exists ONLY inside the persisted inbox value: the send to a
+    # trusted literal recipient is allowed, and its body proves the value survived.
+    assert outbox == [("manager@corp.example", "attacker@evil.example")]
+
+
+def test_a_restart_does_not_launder_labels() -> None:
+    # The security-critical direction: after the restart the restored token still
+    # carries UNTRUSTED, so a send to the extracted (attacker) address is DENIED.
+    # If restoration dropped the label, the token would resolve to a bottom literal
+    # and the send would sail through.
+    script = [
+        _call("read_inbox", {}, "c0"),
+        AIMessage(content="paused before restart"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _call(
+            "send_email",
+            {"recipient": f"{_HANDLE_PREFIX}1>", "body": f"{_HANDLE_PREFIX}0>"},
+            "c2",
+        ),
+        AIMessage(content="done"),
+    ]
+    checkpointer, store = InMemorySaver(), InMemoryStore()
+    config = {"configurable": {"thread_id": "restart-attack"}}
+
+    first, _ = _restartable(script, checkpointer, store)
+    first.invoke({"messages": [HumanMessage(content="Read my email.")]}, config=config)
+
+    second, outbox = _restartable(script, checkpointer, store)
+    result = second.invoke({"messages": [HumanMessage(content="Continue.")]}, config=config)
+    assert outbox == []
+    errors = [
+        m for m in result["messages"] if isinstance(m, ToolMessage) and m.status == "error"
+    ]
+    assert len(errors) == 1 and "send_email" in errors[0].content
+
+
+def test_binding_restore_paginates_past_the_search_default_limit() -> None:
+    # BaseStore.search defaults to LIMIT 10 and silently truncates. Mint twelve
+    # bindings before the restart; afterwards the LAST token must still resolve and
+    # the next mint must be index 12 -- both fail if restoration read only one page.
+    reads = _multi_call([("read_inbox", {}, f"c{i}") for i in range(12)])
+    script = [
+        reads,
+        AIMessage(content="paused before restart"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}11>"}, "d0"),
+        AIMessage(content="done"),
+    ]
+    checkpointer, store = InMemorySaver(), InMemoryStore()
+    config = {"configurable": {"thread_id": "restart-pages"}}
+
+    first, _ = _restartable(script, checkpointer, store)
+    first.invoke({"messages": [HumanMessage(content="Read all my email.")]}, config=config)
+
+    second, _ = _restartable(script, checkpointer, store)
+    result = second.invoke({"messages": [HumanMessage(content="Continue.")]}, config=config)
+    contents = _tool_contents(result["messages"])
+    # The extracted address is untrusted-derived -> masked with the NEXT index.
+    assert contents[-1] == f"{_HANDLE_PREFIX}12>"
+
+
+def test_an_inconsistent_binding_store_fails_closed() -> None:
+    # A store entry whose token name disagrees with deterministic minting means the
+    # store was lost, reordered, or forged; resolving tokens against it could hand
+    # out wrong labels, so session restoration must refuse to proceed.
+    guard = Guard(_POLICY)
+    forged = guard.source("payload", integrity=Taint.UNTRUSTED)
+    store = InMemoryStore()
+    store.put(
+        ("warden", "restart-corrupt", "bindings"),
+        f"{_HANDLE_PREFIX}5>",
+        {"index": 0, **_encode_handle(forged, "payload")},
+    )
+    script = [_call("read_inbox", {}, "c0"), AIMessage(content="done")]
+    app, _ = _restartable(script, InMemorySaver(), store)
+    with pytest.raises(RuntimeError, match="inconsistent"):
+        app.invoke(
+            {"messages": [HumanMessage(content="Read my email.")]},
+            config={"configurable": {"thread_id": "restart-corrupt"}},
+        )
+
+
+def test_without_a_store_a_restart_degrades_tokens_to_bottom_literals() -> None:
+    # The documented store-less residual, pinned: after a restart an old token is
+    # unknown, so it resolves to a harmless bottom literal -- trust is LOWERED,
+    # never forged, and the result is shown raw rather than masked.
+    script = [
+        _call("read_inbox", {}, "c0"),
+        AIMessage(content="paused before restart"),
+        _call("summarize", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        AIMessage(content="done"),
+    ]
+    checkpointer = InMemorySaver()
+    config = {"configurable": {"thread_id": "restart-no-store"}}
+
+    first, _ = _restartable(script, checkpointer, None)
+    first.invoke({"messages": [HumanMessage(content="Read my email.")]}, config=config)
+
+    second, _ = _restartable(script, checkpointer, None)
+    result = second.invoke({"messages": [HumanMessage(content="Continue.")]}, config=config)
+    contents = _tool_contents(result["messages"])
+    assert not contents[-1].startswith(_HANDLE_PREFIX)

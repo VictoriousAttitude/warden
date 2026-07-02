@@ -49,12 +49,26 @@ slot. Declassification is coarse by design: an approval clears *every* argument 
 that one call (the reviewer saw the full provenance and cleared the action); it
 does not relabel upstream handles or affect other calls.
 
-Residual (documented, not hidden): the per-thread session bindings and the
-re-execution memo live in memory, not in a LangGraph checkpoint. A cross-process
-resume therefore loses them -- a token minted before the resume degrades to a
-bottom literal (sound: it can only LOWER trust, never forge it), and an in-flight
-escalation cannot be resumed in a fresh process. Checkpoint-backed bindings are the
-follow-up. Separately, the model still needs each tool's *schema* to call it (via
+Surviving a process restart
+---------------------------
+Compile the graph with a persistent ``store=`` (any LangGraph ``BaseStore``) and
+the node persists each thread's token->handle bindings under the namespace
+``("warden", <thread_id>, "bindings")``, written through at mint time. Store puts
+are durable immediately -- unlike state-channel writes, they are not part of the
+checkpoint transaction -- so bindings minted before an ``interrupt()`` pauses the
+super-step survive it. A fresh process resuming the thread rebuilds the session by
+re-masking the persisted handles in mint order: tokens are minted deterministically
+by count, so the exact names reproduce through the public API, and a mismatch fails
+closed. Labels round-trip exactly (persistence never launders trust); values ride
+the store's serializer, so cross-process durability assumes JSON-representable tool
+values. The store is part of the trusted base exactly like the checkpointer: an
+attacker who can rewrite it can already rewrite the message history itself.
+
+Residual (documented, not hidden): without a store the bindings are process-local
+as before -- a token minted before a cross-process resume degrades to a bottom
+literal (sound: it can only LOWER trust, never forge it). The re-execution memo is
+in-memory either way, so an in-flight escalation cannot yet be resumed in a fresh
+process. Separately, the model still needs each tool's *schema* to call it (via
 ``.bind_tools``); for this first cut you define the LangChain tools for the schema
 and hand Warden the decorated callables keyed by name.
 """
@@ -66,9 +80,23 @@ from typing import Any, Literal, Optional
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.store.base import BaseStore
 from langgraph.types import interrupt
 
-from warden import Guard, Handle, Label, Session, WardenPolicyViolation
+from warden import (
+    Confidentiality,
+    Guard,
+    Handle,
+    Label,
+    Session,
+    Taint,
+    WardenPolicyViolation,
+)
+from warden.core import NodeId
+
+# Intra-package: the session's token wire format ("<warden-handle:N>") is minted
+# by intercept.Session; the adapter parses N back out to persist mint order.
+from warden.intercept import _HANDLE_PREFIX
 
 __all__ = ["WardenToolNode"]
 
@@ -83,6 +111,49 @@ _ON_DENIAL: tuple[str, ...] = ("error", "interrupt")
 # non-None payload marks a call that consumed an interrupt and so must re-issue it
 # on node re-execution to keep LangGraph's positional interrupt counter aligned.
 type _MemoEntry = tuple[dict[str, Any] | None, Any]
+
+# Page size for exhausting a store namespace (BaseStore.search defaults to a
+# LIMIT of 10 and silently truncates -- a naive search would drop bindings).
+_PAGE = 64
+
+
+def _items(store: BaseStore, namespace: tuple[str, ...]) -> list[Any]:
+    """Every item under ``namespace``, paginating past the search default limit."""
+    items: list[Any] = []
+    offset = 0
+    while True:
+        page = store.search(namespace, limit=_PAGE, offset=offset)
+        items.extend(page)
+        if len(page) < _PAGE:
+            return items
+        offset += _PAGE
+
+
+def _encode_handle(handle: Handle, value: Any) -> dict[str, Any]:
+    """Project a handle to a store-safe record: exact label, id hex, raw value.
+
+    The label round-trips EXACTLY (enum values plus the provenance set), so a
+    restored token carries precisely the trust it had -- persistence must never
+    launder a label. The value rides through the store's own serializer; the
+    production backends serialize JSON, so cross-process durability assumes
+    JSON-representable tool values (strings, in practice).
+    """
+    return {
+        "id": handle.id.hex(),
+        "integrity": handle.label.integrity.value,
+        "confidentiality": handle.label.confidentiality.value,
+        "provenance": sorted(handle.label.provenance),
+        "value": value,
+    }
+
+
+def _decode_handle(encoded: Mapping[str, Any]) -> Handle:
+    label = Label(
+        Taint(encoded["integrity"]),
+        Confidentiality(encoded["confidentiality"]),
+        frozenset(encoded["provenance"]),
+    )
+    return Handle(NodeId(bytes.fromhex(encoded["id"])), label, encoded["value"])
 
 
 def _is_approval(decision: Any) -> bool:
@@ -126,23 +197,66 @@ class WardenToolNode:
         thread_id: str = configurable.get("thread_id", _DEFAULT_THREAD)
         return thread_id
 
-    def _session(self, thread_id: str) -> Session:
-        """Return this thread's session, opening one on first use.
+    def _namespace(self, thread_id: str, plane: str) -> tuple[str, str, str]:
+        return ("warden", thread_id, plane)
+
+    def _session(self, thread_id: str, store: BaseStore | None) -> Session:
+        """Return this thread's session, opening (and hydrating) one on first use.
 
         Bindings must outlive a single node call so a token minted in one ReAct
         iteration resolves in the next, so the session is keyed by ``thread_id``
-        and reused, not reopened per call.
+        and reused, not reopened per call. In a fresh process the session is
+        rebuilt from the store before first use; thereafter every mask writes
+        through, so the in-process session stays authoritative.
         """
         session = self._sessions.get(thread_id)
         if session is None:
             session = self._guard.session()
+            if store is not None:
+                self._restore_bindings(session, thread_id, store)
             self._sessions[thread_id] = session
         return session
 
-    def _result_message(self, handle: Handle, session: Session, call_id: str) -> Any:
+    def _restore_bindings(
+        self, session: Session, thread_id: str, store: BaseStore
+    ) -> None:
+        """Replay persisted bindings into a fresh session, in mint order.
+
+        Tokens are minted deterministically by count, so re-masking the restored
+        handles in their original order reproduces the exact token names through
+        the public ``mask`` API alone. A name mismatch means the store disagrees
+        with the session discipline (a lost or forged entry); fail closed rather
+        than resolve tokens to the wrong labels.
+        """
+        namespace = self._namespace(thread_id, "bindings")
+        for item in sorted(_items(store, namespace), key=lambda it: it.value["index"]):
+            token = session.mask(_decode_handle(item.value))
+            if token != item.key:
+                raise RuntimeError(
+                    f"warden binding store for thread {thread_id!r} is inconsistent: "
+                    f"expected token {item.key!r}, minted {token!r}"
+                )
+
+    def _result_message(
+        self,
+        handle: Handle,
+        session: Session,
+        call_id: str,
+        thread_id: str,
+        store: BaseStore | None,
+    ) -> Any:
         """Render a successful result: mask a labeled handle, show a bottom one raw."""
         if handle.label != Label.bottom():
             content = session.mask(handle)
+            if store is not None:
+                # Write the binding through immediately: store puts are durable
+                # even if a later interrupt() pauses this very super-step.
+                index = int(content[len(_HANDLE_PREFIX) : -1])
+                store.put(
+                    self._namespace(thread_id, "bindings"),
+                    content,
+                    {"index": index, **_encode_handle(handle, self._guard.value(handle))},
+                )
         else:
             content = str(self._guard.value(handle))
         return ToolMessage(content=content, tool_call_id=call_id)
@@ -168,6 +282,8 @@ class WardenToolNode:
         call: Mapping[str, Any],
         session: Session,
         memo: dict[str, _MemoEntry],
+        thread_id: str,
+        store: BaseStore | None,
     ) -> Any:
         """Resolve one tool call to a ``ToolMessage`` (may pause via ``interrupt``)."""
         call_id = call["id"]
@@ -202,7 +318,9 @@ class WardenToolNode:
                     for name, handle in handles.items()
                 }
                 approved = self._tools[call["name"]](**cleared)
-                message = self._result_message(approved, session, call_id)
+                message = self._result_message(
+                    approved, session, call_id, thread_id, store
+                )
             else:
                 message = ToolMessage(
                     content=f"{denial} (escalation rejected by reviewer)",
@@ -212,28 +330,33 @@ class WardenToolNode:
             memo[call_id] = (payload, message)
             return message
 
-        message = self._result_message(handle, session, call_id)
+        message = self._result_message(handle, session, call_id, thread_id, store)
         memo[call_id] = (None, message)
         return message
 
     def __call__(
         self,
         state: Mapping[str, Any],
-        # This annotation is LOAD-BEARING and matched TEXTUALLY: under postponed
-        # evaluation LangGraph injects the runnable config only for the literal
-        # spellings "RunnableConfig" / "Optional[RunnableConfig]". Any other
-        # spelling (including "RunnableConfig | None") silently receives None,
-        # which would collapse every thread onto the default session --
-        # cross-thread token leakage on a shared node.
+        # These annotations are LOAD-BEARING and matched TEXTUALLY: under postponed
+        # evaluation LangGraph injects the runnable config and the compiled store
+        # only for the literal spellings "RunnableConfig"/"Optional[RunnableConfig]"
+        # and "BaseStore"/"Optional[BaseStore]". Any other spelling (including
+        # "RunnableConfig | None") silently receives None, which would collapse
+        # every thread onto the default session -- cross-thread token leakage on a
+        # shared node -- and silently disable binding persistence.
         config: Optional[RunnableConfig] = None,  # noqa: UP045
+        store: Optional[BaseStore] = None,  # noqa: UP045
     ) -> dict[str, list[Any]]:
         last = state["messages"][-1]
         thread_id = self._thread_id(config)
-        session = self._session(thread_id)
+        session = self._session(thread_id, store)
         memo = self._memo.setdefault(thread_id, {})
         # A pending interrupt raises out of _resolve; the memo is retained so the
         # already-run calls are not re-executed on resume. Reaching the end means
         # the super-step completed, so the memo is dropped.
-        messages = [self._resolve(call, session, memo) for call in last.tool_calls]
+        messages = [
+            self._resolve(call, session, memo, thread_id, store)
+            for call in last.tool_calls
+        ]
         self._memo.pop(thread_id, None)
         return {"messages": messages}
