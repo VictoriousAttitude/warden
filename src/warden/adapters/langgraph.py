@@ -64,13 +64,22 @@ the store's serializer, so cross-process durability assumes JSON-representable t
 values. The store is part of the trusted base exactly like the checkpointer: an
 attacker who can rewrite it can already rewrite the message history itself.
 
-Residual (documented, not hidden): without a store the bindings are process-local
-as before -- a token minted before a cross-process resume degrades to a bottom
-literal (sound: it can only LOWER trust, never forge it). The re-execution memo is
-in-memory either way, so an in-flight escalation cannot yet be resumed in a fresh
-process. Separately, the model still needs each tool's *schema* to call it (via
-``.bind_tools``); for this first cut you define the LangChain tools for the schema
-and hand Warden the decorated callables keyed by name.
+In ``on_denial="interrupt"`` mode the store also carries the re-execution memo,
+under ``("warden", <thread_id>, "memo")``: each call resolved before the pause is
+written through as it completes, and the namespace is cleared when the super-step
+finishes. A fresh process delivering the resume therefore re-executes the node
+WITHOUT re-running already-run bodies -- side effects stay exactly-once across the
+restart -- while a memoized interrupt still re-issues its payload to hold LangGraph's
+positional counter. So with a store, an in-flight escalation can be approved from a
+different process than the one that raised it.
+
+Residual (documented, not hidden): without a store the bindings and memo are
+process-local as before -- a token minted before a cross-process resume degrades
+to a bottom literal (sound: it can only LOWER trust, never forge it), and an
+in-flight escalation cannot be resumed in a fresh process. Separately, the model
+still needs each tool's *schema* to call it (via ``.bind_tools``); for this first
+cut you define the LangChain tools for the schema and hand Warden the decorated
+callables keyed by name.
 """
 
 from __future__ import annotations
@@ -154,6 +163,23 @@ def _decode_handle(encoded: Mapping[str, Any]) -> Handle:
         frozenset(encoded["provenance"]),
     )
     return Handle(NodeId(bytes.fromhex(encoded["id"])), label, encoded["value"])
+
+
+def _encode_message(message: Any) -> dict[str, Any]:
+    """Project a resolved ``ToolMessage`` to a store-safe record."""
+    return {
+        "content": message.content,
+        "tool_call_id": message.tool_call_id,
+        "status": message.status,
+    }
+
+
+def _decode_message(encoded: Mapping[str, Any]) -> Any:
+    return ToolMessage(
+        content=encoded["content"],
+        tool_call_id=encoded["tool_call_id"],
+        status=encoded["status"],
+    )
 
 
 def _is_approval(decision: Any) -> bool:
@@ -261,6 +287,46 @@ class WardenToolNode:
             content = str(self._guard.value(handle))
         return ToolMessage(content=content, tool_call_id=call_id)
 
+    def _remember(
+        self,
+        memo: dict[str, _MemoEntry],
+        call_id: str,
+        entry: _MemoEntry,
+        thread_id: str,
+        store: BaseStore | None,
+    ) -> None:
+        """Memoize a resolved call; in interrupt mode, write it through the store.
+
+        Only interrupt mode can strand a memo mid-super-step (an ``interrupt()``
+        raises out of the node after some calls already ran), so only there does
+        persistence buy anything; in error mode the super-step always completes
+        and the memo is dropped at the end of the very same call.
+        """
+        memo[call_id] = entry
+        if store is not None and self._on_denial == "interrupt":
+            payload, message = entry
+            store.put(
+                self._namespace(thread_id, "memo"),
+                call_id,
+                {"payload": payload, "message": _encode_message(message)},
+            )
+
+    def _hydrate_memo(
+        self, memo: dict[str, _MemoEntry], thread_id: str, store: BaseStore
+    ) -> None:
+        """Reload calls resolved before a pause, so a resume in a fresh process
+        does not re-run their bodies (exactly-once across the restart)."""
+        namespace = self._namespace(thread_id, "memo")
+        for item in _items(store, namespace):
+            memo.setdefault(
+                item.key, (item.value["payload"], _decode_message(item.value["message"]))
+            )
+
+    def _clear_memo(self, thread_id: str, store: BaseStore) -> None:
+        namespace = self._namespace(thread_id, "memo")
+        for item in _items(store, namespace):
+            store.delete(namespace, item.key)
+
     def _denial_payload(
         self, call: Mapping[str, Any], denial: WardenPolicyViolation
     ) -> dict[str, Any]:
@@ -305,7 +371,7 @@ class WardenToolNode:
                 message = ToolMessage(
                     content=str(denial), tool_call_id=call_id, status="error"
                 )
-                memo[call_id] = (None, message)
+                self._remember(memo, call_id, (None, message), thread_id, store)
                 return message
             payload = self._denial_payload(call, denial)
             decision = interrupt(payload)
@@ -327,11 +393,11 @@ class WardenToolNode:
                     tool_call_id=call_id,
                     status="error",
                 )
-            memo[call_id] = (payload, message)
+            self._remember(memo, call_id, (payload, message), thread_id, store)
             return message
 
         message = self._result_message(handle, session, call_id, thread_id, store)
-        memo[call_id] = (None, message)
+        self._remember(memo, call_id, (None, message), thread_id, store)
         return message
 
     def __call__(
@@ -351,6 +417,11 @@ class WardenToolNode:
         thread_id = self._thread_id(config)
         session = self._session(thread_id, store)
         memo = self._memo.setdefault(thread_id, {})
+        if store is not None and not memo:
+            # A non-empty memo namespace here means a prior process paused on an
+            # interrupt mid-super-step; reload it so the resume in THIS process
+            # skips the bodies that already ran.
+            self._hydrate_memo(memo, thread_id, store)
         # A pending interrupt raises out of _resolve; the memo is retained so the
         # already-run calls are not re-executed on resume. Reaching the end means
         # the super-step completed, so the memo is dropped.
@@ -359,4 +430,6 @@ class WardenToolNode:
             for call in last.tool_calls
         ]
         self._memo.pop(thread_id, None)
+        if store is not None and self._on_denial == "interrupt":
+            self._clear_memo(thread_id, store)
         return {"messages": messages}

