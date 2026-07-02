@@ -1,0 +1,558 @@
+================================================================================
+ WARDEN — MULTI-AGENT INFORMATION-FLOW CONTROL
+ Extending the reference monitor from one agent to a delegation graph:
+ principals, handoff mediation, capability attenuation, declassification
+ authority, and cross-agent provenance.
+
+ Design RFC
+ Version: 0.1
+ Status: Proposed (design only; no build is authorized by this document)
+ Relationship: sits on WARDEN_DESIGN_v0.2.txt (the RFC) and
+               WARDEN_ARCHITECTURE_v0.1.txt (the build spec). Everything here
+               is derived from, and constrained by, the invariants INV-1..9
+               already enforced in the codebase. This document adds INV-10..12.
+ License (intended): Apache-2.0
+================================================================================
+
+--------------------------------------------------------------------------------
+ 0. TL;DR
+--------------------------------------------------------------------------------
+Single-agent runtime IFC is now an occupied space: CaMeL (DeepMind) and FIDES
+(Microsoft) both ship code, and the 2026 consensus is that flow control — not
+detection — is the fix for prompt injection. What remains open, documented, and
+severe is the MULTI-AGENT case: injections that self-replicate across connected
+agents (Prompt Infection) and injected instructions that ride a delegation chain
+upward until they execute with the most privileged agent's authority. Neither
+CaMeL nor FIDES addresses it; both are single-agent by construction.
+
+Warden's answer is deliberately small. A multi-agent system, whatever its
+topology, has exactly two kinds of boundary edges: the TOOL edge (agent -> world)
+and the HANDOFF edge (agent -> agent). Warden already mediates the first. This
+RFC reduces the second to the first:
+
+    A handoff is a CONSEQUENTIAL SINK on the sending side and a LABELED
+    SOURCE on the receiving side.
+
+Under that reduction the entire existing machinery — label join, policy DSL,
+sink gate, session masking, HITL declassification, provenance graph, replay —
+applies to agent-to-agent flows UNCHANGED. What is genuinely new is small and
+listed exhaustively: (a) principals in the decision context, (b) a capability
+attenuation law for delegation, (c) a declassification authority model, and
+(d) two containment arguments (Sections 6.3, 6.4) showing that Prompt Infection
+and upward privilege escalation are stopped by construction, not by detection.
+
+--------------------------------------------------------------------------------
+ 1. WHY MULTI-AGENT, WHY NOW  (evidence)
+--------------------------------------------------------------------------------
+1.1  The threats are empirical, not hypothetical
+------------------------------------------------
+  * PROMPT INFECTION (arXiv 2410.07283): an injection embedded in content
+    processed by one agent instructs it to reproduce the injection in its own
+    output; connected agents re-ingest and re-propagate it — self-replication
+    "like a computer virus." Multi-agent systems are reported highly
+    susceptible; the proposed mitigation ("LLM Tagging" — marking inter-agent
+    messages) is a provenance HEURISTIC without enforcement semantics.
+  * UPWARD PRIVILEGE ESCALATION: instructions injected into a SUBAGENT's
+    context propagate up through the delegation chain until they execute with
+    the permissions of the MOST privileged agent. This is the confused deputy
+    (Hardy 1988) played across a delegation graph: each parent treats its
+    child's output as if it carried the parent's own authority.
+  * CROSS-AGENT CONTAMINATION (arXiv 2603.09002): a unified session store
+    shared by multiple agents is a structural contamination channel.
+  * OWASP's Agentic Security Initiative (ASI07, 2026) prescribes exactly the
+    discipline this RFC formalizes: authenticated inter-agent payloads and a
+    PER-AGENT capability scope that is NOT inherited from the orchestrator.
+
+1.2  The defenders stop at one agent
+-------------------------------------
+CaMeL's dual-LLM design and FIDES's label-propagating planner both assume one
+privileged decision loop. Their guarantees end at the boundary of that loop: a
+subagent's output re-enters the parent as ordinary context, label-free. The
+multi-agent quadrant of runtime IFC is unoccupied — this is Warden's moat gap
+#3, and unlike gaps that erode as competitors ship, this one is structural:
+planner-coupled designs cannot mediate an edge their planner does not own.
+
+1.3  What Warden already has that this needs
+---------------------------------------------
+  * A framework-agnostic monitor at the tool edge (Guard + @guard.tool), with
+    fail-closed capability policy and label join (INV-3/4/5).
+  * Session masking: a model that only ever sees opaque tokens for labeled
+    values cannot launder them into fresh literals (the F5 defense) — proven
+    in-process and through a real LangGraph runtime (WardenToolNode).
+  * A content-addressed provenance DAG (INV-1/2) with replay/fork/diff — the
+    forensics substrate FIDES lacks, which becomes strictly more valuable when
+    a flow crosses agents (Section 8).
+  * Audited declassification (DECLASSIFICATION nodes, INV-3's only sanctioned
+    break) with human-in-the-loop escalation already wired end-to-end.
+
+--------------------------------------------------------------------------------
+ 2. THREAT MODEL  (extends WARDEN_DESIGN v0.2 §5.9)
+--------------------------------------------------------------------------------
+ASSUMPTIONS (trusted): the Warden runtime, the policy file, the store/DAG, and
+the top-level user/system prompt. Tools declare their source honestly (F4's
+scoped-mediation assumption carries over per agent).
+
+UNTRUSTED: every model in every agent. Any agent can be injected; once an agent
+has ingested untrusted content, its OUTPUTS are attacker-influenced. There is no
+"trusted agent" in the delegation graph — only trusted DATA, established by
+labels, and trusted MECHANISM, which is the monitor.
+
+ATTACKER (in scope):
+  A1. Inject arbitrary instructions into any content any agent ingests.
+  A2. Cause a compromised agent to emit arbitrary handoff payloads, including
+      self-replicating injections (Prompt Infection).
+  A3. Attempt to have a low-privilege agent's output drive a high-privilege
+      agent's consequential action (upward escalation / confused deputy).
+  A4. Launder data across agents: read secret data in agent X, hand it to
+      agent Y, egress it through Y's sinks.
+  A5. Request delegation with inflated capabilities ("run this as the
+      orchestrator").
+
+OUT OF SCOPE / RESIDUAL (Section 12): collusion over out-of-band channels the
+monitor does not mediate; covert/timing channels; semantic (non-lexical) taint
+laundering — the same F5 residual as single-agent, bounded per agent by session
+masking; a compromised Warden process itself.
+
+--------------------------------------------------------------------------------
+ 3. THE CORE REDUCTION: HANDOFF = SINK ∘ SOURCE
+--------------------------------------------------------------------------------
+3.1  Definition
+----------------
+A HANDOFF is any transfer of a value from agent S (sender) to agent R
+(receiver): a supervisor dispatching a task to a worker, a worker returning a
+result, a peer-to-peer message. Model it as two existing primitives:
+
+  SEND side:    a CONSEQUENTIAL action `handoff` mediated by the monitor,
+                exactly like send_email. Its arguments are the payload
+                handles; policy gates it on their labels and on the
+                (sender, receiver) pair. Fail-closed, default-deny (INV-5).
+
+  RECEIVE side: a labeled SOURCE, exactly like a tool result. The payload
+                enters R's context as a Handle whose label is
+                    join(label(payload at S), channel_label(S -> R))
+                where channel_label carries at minimum the provenance
+                principal `agent:S` (Section 5) — and, for a sender whose
+                whole context is compromised-by-assumption, the channel's
+                declared floor (e.g. a web-browsing agent's channel may be
+                declared UNTRUSTED regardless of payload label).
+
+3.2  Why the reduction is the design
+-------------------------------------
+Economy of mechanism (Saltzer & Schroeder) is a security property, not a
+convenience: every line NOT added to the monitor is a line that cannot be
+wrong. Under this reduction:
+  * The policy engine needs no new evaluation semantics — a handoff rule is a
+    rule over an action's argument labels, which is what `decide` already is.
+  * The monitor needs no new gate — `handoff` is a registered consequential
+    action fronted by the same sink gate (INV-4 applies verbatim).
+  * Label propagation needs no new operator — the receive-side join is INV-3.
+  * Session masking applies per agent (Section 7): R's model sees a TOKEN for
+    a labeled payload, not the bytes.
+  * Replay and forensics need nothing — handoffs are nodes in the same DAG.
+
+The alternative — a bespoke "inter-agent protocol layer" with its own checks —
+is how the surveyed mitigations (LLM Tagging, message signing without flow
+semantics) end up as heuristics. Warden refuses the second mechanism.
+
+3.3  New invariant
+-------------------
+INV-10  HANDOFF MEDIATION. No value crosses from one agent's context to
+        another's except through the monitor as a `handoff` action; the
+        received value's label is at least the join of the sent value's label
+        and the channel label. (The multi-agent instance of INV-4 + INV-3.)
+
+Scoped honestly, as F4 demands: INV-10 holds over handoffs wired through the
+boundary, verified by the same runtime gate + static bypass-lint; agents that
+exchange data through an unmediated side channel (a shared file, a global) are
+outside the guarantee and inside the threat-model assumption. The cross-agent
+contamination result (arXiv 2603.09002) is precisely the price of violating
+this: a unified, unmediated session store IS a side channel. Warden's rule:
+one session per (agent, thread), no shared mutable context (Section 7).
+
+--------------------------------------------------------------------------------
+ 4. PRINCIPALS
+--------------------------------------------------------------------------------
+4.1  What a principal is
+-------------------------
+A PRINCIPAL is the identity an action is performed AS: `user`, `orchestrator`,
+`agent:researcher`, `agent:mailer`. Principals appear in three places:
+
+  P-A. In PROVENANCE: a handoff-received value carries `agent:S` in its
+       provenance set. No schema change — provenance is already
+       frozenset[str], and the policy DSL already tests membership
+       (`'agent:researcher' in data.provenance`). Zero-cost, ships first.
+
+  P-B. In the DECISION CONTEXT: the monitor learns WHICH agent is calling the
+       sink. Today `decide(policy, action, labels, tool_class)` is
+       principal-blind; multi-agent adds the acting principal so policy can
+       scope capabilities per agent (Section 4.2). This is the one genuine
+       extension to the decision function.
+
+  P-C. In DECLASSIFICATION AUTHORITY: who may lower which label (Section 9).
+
+4.2  Per-agent capability scope (OWASP ASI07, made precise)
+------------------------------------------------------------
+Each agent has its OWN policy scope — the set of (action, condition) allow
+rules that can ever fire for it. Scope is NOT inherited from the orchestrator:
+`agent:mailer` may `allow send_email if ...`; `agent:researcher` has no
+send_email allow rule at all, so default-deny (INV-5) makes the capability
+nonexistent for it — not "denied," ABSENT. Concretely the policy DSL grows one
+clause (Section 6.1): an optional `by <principal>` qualifier on rules, with
+unqualified rules applying to all principals (backward compatible: every
+existing single-agent policy is a valid multi-agent policy for the single
+implicit principal).
+
+4.3  New invariant
+-------------------
+INV-11  NO AMPLIFICATION THROUGH DELEGATION. For every delegation edge
+        S -> R, the effective capability set satisfies
+            effective(R, task) ⊆ scope(R)
+        and, when S attaches a grant to the delegation,
+            effective(R, task) ⊆ scope(R) ∩ grant(S, task) and
+            grant(S, task)    ⊆ effective(S).
+        An agent can attenuate what it delegates; it can never amplify, and a
+        receiver can never exceed its own scope regardless of who asked.
+        (Capability discipline: authority only attenuates along delegation —
+        with ASI07's floor that the receiver's OWN scope, not the delegator's,
+        is the outer bound.)
+
+The attenuation grant is how "run this as the orchestrator" (A5) dies: the
+request is just data; capabilities are looked up by the ACTING principal
+(P-B), which the monitor establishes from the mediated call site, never from
+message content. There is no ambient authority to steal.
+
+--------------------------------------------------------------------------------
+ 5. LABELS ACROSS THE HANDOFF  (what changes: nothing; what is pinned: the join)
+--------------------------------------------------------------------------------
+The Label product semilattice (Taint × Confidentiality × Provenance) is
+unchanged. The handoff pins three facts:
+
+  5.1 INTEGRITY joins across agents. If a payload is UNTRUSTED at S, it is
+      UNTRUSTED at R, and at everything R derives from it — the same
+      WHOLE_CONTEXT/handle propagation as within one agent. Agent boundaries
+      are not laundering points. (This single sentence is what stops Prompt
+      Infection; Section 6.3.)
+
+  5.2 CONFIDENTIALITY gates the SEND. A handoff is egress: the payload leaves
+      one context for another. `deny handoff if data.confidentiality >= secret
+      and ...` is an ordinary rule; per-receiver reader discipline (DLM-style
+      reader sets, ARCHITECTURE §5.1's documented opt-in) is the expressive
+      form, with levels as the shipped default. This kills A4 at the first
+      hop that exceeds the receiver's clearance.
+
+  5.3 PROVENANCE accumulates the PATH. After two hops a value's provenance
+      reads {inbox, agent:researcher, agent:summarizer} — the delegation
+      chain is IN the label, and therefore available to policy ("deny any
+      sink whose data ever transited the quarantine agent") and to forensics
+      (Section 8) without any new mechanism.
+
+--------------------------------------------------------------------------------
+ 6. POLICY: THE TWO LIFTED INVARIANTS AND THE CONTAINMENT ARGUMENTS
+--------------------------------------------------------------------------------
+6.1  DSL delta (exhaustive)
+----------------------------
+Stage A (zero DSL change): register the handoff as consequential actions named
+per edge or per receiver — `handoff_researcher`, `handoff_mailer` — and write
+ordinary rules over them. Everything in Sections 3–5 works with the DSL as it
+exists today. This is deliberately the first shipped form: it proves the
+reduction before the grammar grows.
+
+Stage B (one production): an optional principal qualifier,
+    rule := ("deny" | "allow") action ["by" principal] ["if" expr]
+evaluated as: a qualified rule fires only when the acting principal matches;
+deny ≻ allow and consequential default-deny are unchanged. The evaluator stays
+total and side-effect-free (ARCHITECTURE §7.1); the type-checker learns one
+token. Nothing else. (A full "agent blocks" syntax was considered and
+rejected: it adds grouping sugar, no semantics.)
+
+6.2  FIDES's invariants, lifted to the handoff edge
+----------------------------------------------------
+FIDES enforces, within one agent: (I1) consequential tool calls must be based
+on trusted-integrity data; (I2) data flows only to permitted readers. Warden
+lifts both so they hold ACROSS the delegation graph:
+
+  I1' At EVERY agent, every consequential action — including `handoff` itself
+      — gates on the join-label of its arguments, where the join includes
+      labels imported over handoff edges (INV-10).
+  I2' A handoff is a flow to a reader; the receiving agent's clearance is
+      policy, checked at the send gate (5.2).
+
+6.3  Containment argument T1: Prompt Infection
+-----------------------------------------------
+Claim: under INV-3 + INV-10, a self-replicating injection can propagate its
+TEXT to every agent yet can never satisfy a trusted-integrity condition at any
+consequential sink of any agent.
+
+Argument. The infection enters at some source with integrity UNTRUSTED (a tool
+result or channel floor — the only ways attacker bytes enter, by the threat
+model). Every value derived from it within an agent carries UNTRUSTED (INV-3,
+propagation soundness within one agent). Every handoff that carries it, or
+anything derived from it, yields at the receiver a label that joins the sent
+label (INV-10), hence UNTRUSTED. By induction over the delegation graph (which
+the DAG renders acyclic per run), every copy at every agent is UNTRUSTED. A
+sink rule requiring trusted integrity therefore never fires an allow for it;
+consequential default-deny (INV-5) covers unlisted sinks. Replication is
+free; AUTHORITY never replicates. ∎
+
+Contrast with "LLM Tagging": tagging marks messages and hopes downstream
+models honor the mark. Here the mark is a label the MONITOR enforces; the
+models' cooperation is not assumed (Section 2's no-trusted-agent stance).
+
+Boundary of the claim, stated as in F5: the argument is over flows the
+propagation strategy tracks. Within a single agent, semantic laundering is the
+documented M1 residual, mitigated where dual-plane masking applies (Section 7
+extends exactly that mitigation across agents). The claim is containment of
+AUTHORITY, not eradication of replicated text.
+
+6.4  Containment argument T2: upward privilege escalation
+----------------------------------------------------------
+Claim: under INV-10 + INV-11, a subagent's output cannot cause a parent to
+execute a consequential action the parent's policy would not have permitted on
+untrusted data — i.e., the delegation chain confers no authority on data.
+
+Argument. Escalation requires a parent sink to fire on data originating in
+the child. That data arrives ONLY over the mediated handoff (INV-10), labeled
+with at least the child-side join — untrusted if the child was injected
+(6.3). The parent's sink gates on that label (I1'); an allow rule requiring
+trusted integrity does not fire; default-deny covers the rest. Could the
+parent's own AUTHORITY be invoked instead? Authority attaches to the acting
+principal established by the monitor at the call site (4.3), never to message
+content, and delegation only attenuates it (INV-11). The remaining paths are
+exactly the sanctioned ones: a human (or configured authority) declassifies
+the specific flow (Section 9), auditably. Escalation is thus reduced from
+"trick the most privileged model" to "compromise the monitor or the
+declassification authority" — which is the correct residual for a reference
+monitor to leave. ∎
+
+--------------------------------------------------------------------------------
+ 7. SESSIONS AND MASKING: QUARANTINE AS A PER-AGENT PROPERTY
+--------------------------------------------------------------------------------
+Single-agent Warden already runs the dual-plane discipline through Session:
+labeled values are masked behind opaque tokens; the model plans over tokens;
+unmask happens only inside the mediated call. Multi-agent generalizes by
+POLICY, not mechanism:
+
+  * One session per (agent, thread). Tokens are NOT shared across agents —
+    a token minted for S's model is not a live binding in R's session (the
+    codebase already enforces exactly this per thread; per agent is the same
+    keying with the principal added).
+  * A handoff payload that is labeled arrives at R MASKED: R's model receives
+    a fresh token from R's own session, never the raw bytes. The infection
+    payload of 6.3 is not merely impotent at R's sinks — R's model never
+    reads it. Prompt Infection requires the receiving model to READ the
+    replicated instruction; masking starves it at every hop where the
+    payload's label is above bottom.
+  * Deliberate raw sharing (R legitimately needs the text, e.g. a summarizer)
+    is the Q-LLM pattern: R reads raw untrusted bytes but R's scope (4.2)
+    contains no consequential capabilities — reading agents and acting agents
+    are different principals. This is Meta's Rule of Two, expressible as
+    policy: no principal's scope combines {ingest-untrusted, act-externally}
+    (+ access-sensitive) — encodable as a lint over the compiled policy,
+    not a new mechanism.
+
+The shared-session-store contamination channel (2603.09002) is closed by
+construction: there is no unified store; there are per-(agent, thread)
+sessions and one MEDIATED graph.
+
+--------------------------------------------------------------------------------
+ 8. CROSS-AGENT PROVENANCE: THE GRAPH IS THE MOAT
+--------------------------------------------------------------------------------
+One run = one content-addressed DAG, whatever the number of agents. A handoff
+contributes ordinary TOOL_CALL/TOOL_RESULT nodes for the `handoff` action
+(Stage A; a dedicated HANDOFF NodeKind is a Stage-C nicety for rendering, not
+semantics — deferred, since NodeKind extension touches INV-1 conformance
+vectors and buys no enforcement). Consequences, all free:
+
+  * FORENSICS ACROSS THE CHAIN: a denial's provenance path (INV-6) now reads
+    "tainted at n2 (fetch_url, agent:researcher, UNTRUSTED) -> handoff to
+    orchestrator at n7 -> joined into `recipient` at n9 -> send_email
+    blocked." This is the artifact the multi-agent incident reports lack —
+    EchoLeak's forensics gap, squared by delegation.
+  * REPLAY of a whole multi-agent run is the single-run Determinism Theorem
+    (ARCHITECTURE §10.1) unmodified: handoffs are boundary events with logical
+    seq like any other; INV-8 keeps re-runs side-effect-free, so captured
+    Prompt-Infection runs become permanent regression tests.
+  * COUNTERFACTUAL INJECTION at a handoff boundary — substitute the payload a
+    subagent returned, suffix-replay, assert containment — is the
+    CounterfactualReplayer doing multi-agent adversarial fuzzing with zero
+    new code.
+  * DIFF across topologies: same task, two delegation structures, first
+    divergence and blast radius by canonical topo order (F7).
+
+FIDES is runtime-only; no competing system has this substrate under a
+multi-agent monitor. This section is why moat gaps #2 and #3 compound.
+
+--------------------------------------------------------------------------------
+ 9. DECLASSIFICATION AUTHORITY  (the hard question, answered narrowly)
+--------------------------------------------------------------------------------
+Single-agent Warden has one implicit declassification authority: the caller of
+guard.declassify (in practice, the human behind the HITL interrupt). Multi-
+agent forces the question: MAY AGENT X DECLASSIFY VALUE V?
+
+Grounding: in the Decentralized Label Model (Myers & Liskov), only a policy's
+OWNER may relax it. Warden's translation, kept deliberately minimal:
+
+  D1. Agents have NO declassification authority by default. An injected agent
+      that could declassify would collapse 6.3/6.4 — declassification is the
+      one sanctioned monotonicity break (INV-3), so it must sit OUTSIDE the
+      untrusted perimeter, and every agent is inside it (Section 2).
+  D2. Authority is granted per (principal, label-region) in policy, e.g. the
+      orchestrator MAY lower confidentiality of values whose provenance is
+      ⊆ {db, agent:summarizer}, never integrity. Grants are static policy,
+      not runtime state, so the evaluator stays total.
+  D3. The HUMAN (HITL interrupt, already built) is the root authority: any
+      denial anywhere in the delegation graph can escalate to a person, and
+      the approval declassifies THAT call's arguments only — the coarse,
+      audited, per-call downgrade already shipped in WardenToolNode.
+  D4. Every declassification is a DECLASSIFICATION node recording the
+      authority principal (one payload field added to an existing node kind),
+      so the forensic question "who lowered this and by what right" has a
+      content-addressed answer.
+
+INV-12  DECLASSIFICATION AUTHORITY. label(child) ⊏ join(parents) only across
+        a DECLASSIFICATION node whose recorded authority holds a matching
+        grant (D2) or is the human root (D3). No agent principal holds a
+        grant unless policy names it explicitly; integrity grants to agent
+        principals are rejected at policy compile time (an agent may never
+        bless untrusted data as trusted — that is exactly the escalation
+        primitive, so the compiler forbids it rather than trusting
+        configuration discipline).
+
+--------------------------------------------------------------------------------
+ 10. MONITOR PLACEMENT
+--------------------------------------------------------------------------------
+10.1  Stage A — in-process delegation (one Guard, many agents)
+---------------------------------------------------------------
+The dominant real deployments (LangGraph supervisor/subgraphs, CrewAI, OpenAI
+Agents SDK handoffs) run all agents in ONE process. Placement: ONE Guard, one
+DAG, one policy; per-(agent, thread) sessions; the handoff pseudo-tool; the
+acting principal threaded through the decision context (4.2). TCB = the Guard,
+as today. This covers A1–A5 for in-process topologies and is where the
+containment arguments are first proven executable (Section 11). The LangGraph
+adapter extends naturally: a supervisor graph's subgraph boundary is the
+handoff edge; WardenToolNode instances share the Guard and declare their
+principal.
+
+10.2  Stage B — cross-process / cross-org (federated monitors)
+---------------------------------------------------------------
+When agents are separate services, a label must survive a network hop with its
+integrity intact — otherwise the receiving monitor is trusting a client
+assertion. Design (deferred, sketched to fix the direction):
+  * Each process runs its own Warden monitor; the handoff SEND gate signs a
+    LABEL ENVELOPE (payload hash, label, sender principal, run/graph anchor);
+    the RECEIVE side verifies before admitting the value at that label —
+    unverifiable envelope => the channel floor applies (fail-closed to
+    UNTRUSTED, never open).
+  * This aligns with where the ecosystem already is: A2A v1.0 (Linux
+    Foundation) has signed Agent Cards and authenticated payloads (ASI07's
+    mTLS + signing); the Agent Card is the natural carrier for an agent's
+    DECLARED capability scope (4.2) and channel floors (3.1).
+  * Content-addressing federates the forensics for free: node ids are
+    location-independent (INV-1), so per-process DAG shards referencing each
+    other's hashes compose into one verifiable cross-org provenance graph —
+    the Merkle structure was chosen for exactly this property.
+  * Residuals to solve before building: key distribution/rotation, replay of
+    envelopes across runs (bind envelope to run id), and clock-free ordering
+    of cross-process events (logical seq per edge, merged by the DAG).
+
+Stage A requires no cryptography and delivers the theorems; Stage B is
+engineering on a settled design. Build order follows risk, as always.
+
+--------------------------------------------------------------------------------
+ 11. EVALUATION PLAN  (hermetic, like everything else in the repo)
+--------------------------------------------------------------------------------
+No orchestrator is built and no live LLM enters CI. As with eval/echoleak.py
+and eval/agentdojo.py: scripted deterministic agents, mocked sinks, the
+Recorder for byte-stable replay. Suites, each with the release-gate metric
+triple (utility / utility-under-attack / ASR) plus label-creep == 0:
+
+  E1. PROMPT INFECTION: a 3-agent chain (reader -> summarizer -> mailer); the
+      infected document instructs each agent to append the injection and
+      forward. Assert: text may replicate through READ_ONLY hops, yet every
+      consequential action driven by it is denied at every agent (T1); benign
+      chain unaffected (FP 0); masked variant: the replicated payload never
+      appears in any downstream model's visible messages.
+  E2. UPWARD ESCALATION: worker ingests untrusted content directing
+      "have the orchestrator send X"; assert the orchestrator's send is
+      denied though the orchestrator itself never read untrusted bytes (T2);
+      the HITL escalation path approves it auditably (D3) and the
+      DECLASSIFICATION node records the authority (D4).
+  E3. ATTENUATION: delegation with an inflated grant is clamped to scope(R)
+      (INV-11); a policy granting an agent an integrity declassification
+      fails to compile (INV-12).
+  E4. CONFIDENTIALITY HOP: secret value handed toward an agent whose
+      clearance excludes it — denied at the SEND gate, with the provenance
+      path crossing the agent boundary (I2', Section 8).
+  E5. HARNESS: replay a recorded E1 run byte-identically with zero side
+      effects (INV-7/8); counterfactually inject the infection payload at a
+      clean handoff boundary and assert containment (Section 8).
+
+Property tests extend the INV map: INV-10 (no unmediated cross-session flow in
+the fixture corpus, by the same bypass-lint family as INV-4), INV-11
+(Hypothesis: ∀ grants, effective ⊆ scope), INV-12 (compile-time rejection).
+
+--------------------------------------------------------------------------------
+ 12. RISKS, RESIDUALS, NON-GOALS
+--------------------------------------------------------------------------------
+  R1. LABEL CREEP COMPOUNDS ACROSS HOPS: joins across N agents over-taint
+      faster than within one. The mitigation is structural, not statistical:
+      masking keeps per-agent creep bounded (tokens don't smear), and the
+      read/act principal split (Section 7) makes the common topologies
+      creep-free at sinks. The label-creep gate (guard ON == OFF on benign
+      multi-agent suites) remains release-blocking — same bar as M1.
+  R2. UNMEDIATED SIDE CHANNELS between in-process agents (shared globals,
+      files). Same class as F4; same remedy: bypass-lint + threat-model
+      assumption, stated in docs, never papered over.
+  R3. SEMANTIC LAUNDERING within a raw-reading agent (F5) is unchanged; the
+      multi-agent design neither worsens nor fixes it — it CONTAINS it to the
+      reading agent's (empty) consequential scope.
+  R4. AUTHORITY-GRANT MISCONFIGURATION (D2 too broad) re-opens 6.4. Mitigated
+      by compile-time rejection of the dangerous class (integrity grants to
+      agents, INV-12) and by every use being an audited node.
+  NON-GOALS: no orchestrator, no agent runtime, no message bus, no network
+      transport in Stage A; not a multi-agent framework — Warden mediates the
+      two edges and ships zero agents. Stage B cryptography is design-fixed
+      but explicitly not scheduled by this document.
+
+--------------------------------------------------------------------------------
+ 13. STAGED BUILD SKETCH  (for future approval; NOT authorized here)
+--------------------------------------------------------------------------------
+  M5.0  This RFC (design review; adversarial re-read of 6.3/6.4 invited).
+  M5.1  Stage A core: acting principal in the decision context; the handoff
+        pseudo-tool; per-(agent, thread) sessions; E1/E2/E4/E5 suites.
+        Zero DSL change; zero core-node change.
+  M5.2  DSL `by <principal>`; attenuation grants; INV-11/12 property tests
+        and compile-time rejections; E3.
+  M5.3  LangGraph supervisor adapter: WardenToolNode principals + subgraph
+        handoff mediation (the drop-in story, again).
+  M5.4  Stage B label envelopes over A2A (separate RFC once M5.1–3 hold).
+
+--------------------------------------------------------------------------------
+ 14. REFERENCES
+--------------------------------------------------------------------------------
+[INFECT]  "Prompt Infection: LLM-to-LLM Prompt Injection within Multi-Agent
+          Systems." arXiv:2410.07283.
+[CONTAM]  Cross-agent contamination via unified session stores.
+          arXiv:2603.09002.
+[ASI07]   OWASP Agentic Security Initiative, ASI07 (2026): authenticated
+          inter-agent payloads; per-agent, non-inherited capability scope.
+[FIDES1]  Costa, Köpf et al., "Securing AI Agents with Information-Flow
+          Control." arXiv:2505.23643. (Single-agent; the two invariants
+          lifted in §6.2.)
+[CAMEL1]  Debenedetti et al., "Defeating Prompt Injections by Design."
+          arXiv:2503.18813. (Single-agent dual-LLM; the Q-pattern in §7.)
+[DLM]     Myers & Liskov, "A Decentralized Model for Information Flow
+          Control." SOSP 1997. (Ownership-scoped declassification, §9.)
+[HARDY]   Hardy, "The Confused Deputy." ACM SIGOPS OSR 22(4), 1988.
+[SALTZER] Saltzer & Schroeder, "The Protection of Information in Computer
+          Systems." 1975. (Complete mediation; economy of mechanism.)
+[RULE2]   Meta, "Agents Rule of Two" (2025): at most two of {untrusted input,
+          sensitive access, external action} per operation. (§7 policy lint.)
+[A2A]     A2A protocol v1.0, Linux Foundation (2026): signed Agent Cards,
+          authenticated payloads. (§10.2 envelope carrier.)
+[MOVES2]  "The Attacker Moves Second" (Nov 2025): >90% adaptive bypass of 12
+          detection defenses. (Why enforcement, not detection.)
+
+================================================================================
+ END — WARDEN MULTI-AGENT IFC RFC v0.1
+================================================================================
